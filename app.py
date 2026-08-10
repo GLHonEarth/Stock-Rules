@@ -355,6 +355,97 @@ def bidask_table(realtime):
     return pd.DataFrame(rows)[["档位", "卖价", "卖量(手)", "买价", "买量(手)"]]
 
 
+# --------------------------------------------------------------------------
+# 实时行情头部：数量格式化 + 自定义行情栏（保证完整显示、时间精确到秒）
+# --------------------------------------------------------------------------
+def _fmt_vol(hand):
+    """成交量（手）格式化：亿手 / 万手 / 手。"""
+    hand = float(hand)
+    if hand >= 1e8:
+        return f"{hand / 1e8:.2f}亿手"
+    if hand >= 1e4:
+        return f"{hand / 1e4:.2f}万手"
+    return f"{hand:.0f}手"
+
+
+def _fmt_amount(yuan):
+    """成交额（元）格式化：万亿 / 亿 / 万 / 元。"""
+    yuan = float(yuan)
+    if yuan >= 1e12:
+        return f"{yuan / 1e12:.2f}万亿"
+    if yuan >= 1e8:
+        return f"{yuan / 1e8:.2f}亿"
+    if yuan >= 1e4:
+        return f"{yuan / 1e4:.2f}万"
+    return f"{yuan:.0f}元"
+
+
+def _fmt_update_time(ts_str):
+    """
+    规范化数据更新时间，确保精确到秒。
+    兼容 "2026-08-07 15:34:59" / "2026-08-07 15:34" / "08-07 15:34:59" 等格式，
+    统一输出 "MM-DD HH:MM:SS"；缺少秒的自动补 :00。
+    """
+    s = str(ts_str or "").strip()
+    if not s:
+        return "—"
+    parts = s.replace("/", "-").split()
+    if len(parts) >= 2:
+        date_part, time_part = parts[0], parts[1]
+        if len(time_part) == 5:            # HH:MM -> 补秒
+            time_part += ":00"
+        if len(date_part) == 10:           # "2026-08-07" -> "08-07"
+            date_show = date_part[5:]
+        else:
+            date_show = date_part
+        return f"{date_show} {time_part}"
+    return s
+
+
+def quote_header_html(rt, name, code):
+    """
+    顶部实时行情栏（HTML，flex 自动换行，任何窗口宽度下均完整显示）。
+    价格红涨绿跌；更新时间精确到秒并以醒目颜色展示。
+    """
+    price = rt["最新价"]
+    chg = rt["涨跌幅"]
+    up = chg >= 0
+    color = "#ef4444" if up else "#22c55e"
+    arrow = "▲" if up else "▼"
+    return f"""
+    <div style="display:flex;flex-wrap:wrap;gap:12px 36px;align-items:center;
+                background:#0f172a;border:1px solid #1e293b;border-radius:10px;
+                padding:14px 22px;margin-bottom:8px;">
+      <div style="margin-right:auto;">
+        <div style="font-size:16px;color:#94a3b8;">{name}（{code}）· 最新价</div>
+        <span style="font-size:40px;font-weight:800;color:{color};">{price:.2f}</span>
+        <span style="margin-left:12px;font-size:22px;font-weight:800;color:{color};">{arrow} {chg:+.2f}%</span>
+        <span style="margin-left:10px;font-size:16px;color:#94a3b8;">涨跌额 {rt['涨跌额']:+.2f}</span>
+      </div>
+      <div>
+        <div style="font-size:15px;color:#94a3b8;">今开 / 昨收</div>
+        <div style="font-size:21px;font-weight:700;">{rt['今开']:.2f} / {rt['昨收']:.2f}</div>
+      </div>
+      <div>
+        <div style="font-size:15px;color:#94a3b8;">最高 / 最低</div>
+        <div style="font-size:21px;font-weight:700;">{rt['最高']:.2f} / {rt['最低']:.2f}</div>
+      </div>
+      <div>
+        <div style="font-size:15px;color:#94a3b8;">成交量</div>
+        <div style="font-size:21px;font-weight:700;">{_fmt_vol(rt['成交量(手)'])}</div>
+      </div>
+      <div>
+        <div style="font-size:15px;color:#94a3b8;">成交额</div>
+        <div style="font-size:21px;font-weight:700;">{_fmt_amount(rt['成交额(元)'])}</div>
+      </div>
+      <div>
+        <div style="font-size:15px;color:#94a3b8;">数据更新时间</div>
+        <div style="font-size:21px;font-weight:800;color:#facc15;">{_fmt_update_time(rt['时间戳'])}</div>
+      </div>
+    </div>
+    """
+
+
 def sidebar_library():
     """
     侧边栏股票库 UI：
@@ -500,17 +591,9 @@ def render_dashboard(data, code, disp, period_label, capital, show_n,
     rt = data.get("realtime")
     title_name = data.get("name") or disp or code
 
-    # ---------- 顶部：实时行情指标卡 ----------
+    # ---------- 顶部：实时行情栏（自定义 HTML，完整显示、时间精确到秒） ----------
     if rt is not None:
-        up_down = "🔴" if rt["涨跌幅"] >= 0 else "🟢"
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric(f"{title_name}（{code}）最新价",
-                  f"{rt['最新价']:.2f}", f"{up_down} {rt['涨跌幅']:+.2f}%",
-                  delta_color="normal")
-        c2.metric("今开 / 昨收", f"{rt['今开']:.2f} / {rt['昨收']:.2f}")
-        c3.metric("最高 / 最低", f"{rt['最高']:.2f} / {rt['最低']:.2f}")
-        c4.metric("成交量 / 成交额", f"{rt['成交量(手)']/10000:.1f}万手 / {rt['成交额(元)']/1e8:.2f}亿")
-        c5.metric("更新时间", rt["时间戳"])
+        st.markdown(quote_header_html(rt, title_name, code), unsafe_allow_html=True)
     elif hist is not None:
         last = hist.iloc[-1]
         st.info(f"{title_name}（{code}）实时行情暂不可用，以下为最近交易日 "
