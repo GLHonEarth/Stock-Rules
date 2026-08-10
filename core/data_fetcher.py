@@ -15,6 +15,7 @@
   - 失败自动重试（指数退避）+ 多 User-Agent 轮换
   - 数据落盘缓存（CSV + 时间戳），避免重复请求、加速页面刷新
 """
+import ast
 import json
 import os
 import random
@@ -127,19 +128,35 @@ def normalize_symbol(symbol):
     return f"{prefix}{code}", code
 
 
+def _norm_name(s):
+    """股票名称规范化：全角字母/数字转半角、去除所有空白，便于模糊匹配。"""
+    if not s:
+        return ""
+    s = str(s).strip()
+    out = []
+    for c in s:
+        o = ord(c)
+        if 0xFF01 <= o <= 0xFF5E:      # 全角 -> 半角
+            out.append(chr(o - 0xFEE0))
+        else:
+            out.append(c)
+    return "".join(out).replace(" ", "").replace("　", "")
+
+
 def code_name_map(refresh=False):
-    """全市场 代码->名称 映射（用于名称搜索），带磁盘缓存。"""
+    """全市场 代码->名称 映射（用于名称搜索），带磁盘缓存。
+    代码统一补齐为 6 位字符串（避免 CSV 往返丢失前导零，如 000001）。"""
     key = "code_name"
     if not refresh:
         df = _cache_load(key, config.CACHE_TTL["code_name"])
         if df is not None and len(df) > 100:
-            return dict(zip(df["代码"], df["名称"]))
+            return {str(c).zfill(6): str(n) for c, n in zip(df["代码"], df["名称"])}
     mapping = {}
     # 优先：东财全量（快）；失败降级：新浪全市场（约 40 秒，仅首次）
     try:
         import akshare as ak
         df = ak.stock_info_a_code_name()
-        mapping = dict(zip(df["code"].astype(str), df["name"]))
+        mapping = {str(c).zfill(6): str(n) for c, n in zip(df["code"], df["name"])}
     except Exception:  # noqa: BLE001
         try:
             df = ak.stock_zh_a_spot()
@@ -147,17 +164,17 @@ def code_name_map(refresh=False):
             for _, r in df.iterrows():
                 c = str(r["代码"])
                 c = c[2:] if c.startswith(("sh", "sz", "bj")) else c
-                mapping[c] = str(r["名称"])
+                mapping[str(c).zfill(6)] = str(r["名称"])
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"获取股票列表失败: {e}")
-    _cache_save(key, pd.DataFrame(list(mapping.items()), columns=["代码", "名称"]))
+    _cache_save(key, pd.DataFrame(sorted(mapping.items()), columns=["代码", "名称"]))
     return mapping
 
 
 def resolve_symbol(user_input):
     """
     输入股票代码或名称，返回 (sina_code, em_code, name)。
-    输入为中文名称时自动查表（如 '贵州茅台'）。
+    输入为中文名称时自动查表（如 '贵州茅台'、'平安银行'）。
     """
     user_input = user_input.strip()
     try:
@@ -165,9 +182,12 @@ def resolve_symbol(user_input):
     except ValueError:
         pass
     mapping = code_name_map()
-    hit = [c for c, n in mapping.items() if n == user_input]
+    # 用规范化后的名称做匹配（容忍全角/空格差异，如 "万 科Ａ" -> "万科A"）
+    q = _norm_name(user_input)
+    norm_map = {c: _norm_name(n) for c, n in mapping.items()}
+    hit = [c for c, n in norm_map.items() if n == q]
     if not hit:
-        hit = [c for c, n in mapping.items() if user_input in n]
+        hit = [c for c, n in norm_map.items() if q and q in n]
     if not hit:
         raise ValueError(
             f"未找到股票: {user_input}。请检查代码（如 600519）或名称（如 贵州茅台）是否正确。")
@@ -264,16 +284,36 @@ def _sina_kline(symbol, scale=240, datalen=800):
 # --------------------------------------------------------------------------
 # 实时行情 + 五档盘口（新浪，PRD 2.2）
 # --------------------------------------------------------------------------
+def _parse_rt_lists(data):
+    """CSV 缓存往返后，把五档盘口字符串还原为 [(量,价)x5] 列表。"""
+    for k in ("买盘", "卖盘"):
+        v = data.get(k)
+        if isinstance(v, str):
+            try:
+                data[k] = ast.literal_eval(v)
+            except Exception:  # noqa: BLE001
+                data[k] = []
+    return data
+
+
+def _rt_to_row(data):
+    """实时行情 dict -> 可缓存行（盘口序列化为 JSON 字符串）。"""
+    row = {k: v for k, v in data.items() if k not in ("买盘", "卖盘")}
+    row["买盘"] = json.dumps(data["买盘"])
+    row["卖盘"] = json.dumps(data["卖盘"])
+    return pd.DataFrame([row])
+
+
 def get_realtime(symbol):
     """
     返回 dict：最新价/涨跌幅/昨收/今开/最高/最低/成交量/成交额/时间戳/五档盘口。
-    盘口结构: {'买': [(价,量)x5], '卖': [(价,量)x5]}
+    盘口结构: {'买盘': [(量,价)x5], '卖盘': [(量,价)x5]}
     """
     sina_code, _ = normalize_symbol(symbol)
     cache_key = f"realtime_{sina_code}"
     df = _cache_load(cache_key, config.CACHE_TTL["realtime"])
     if df is not None and len(df) > 0:
-        return df.iloc[0].to_dict()
+        return _parse_rt_lists(df.iloc[0].to_dict())
 
     url = f"https://hq.sinajs.cn/list={sina_code}"
     text = _http_get(url, encoding="gbk").text
@@ -309,7 +349,7 @@ def get_realtime(symbol):
         "买盘": bids,
         "卖盘": asks,
     }
-    _cache_save(cache_key, pd.DataFrame([data]))
+    _cache_save(cache_key, _rt_to_row(data))
     return data
 
 
@@ -463,3 +503,95 @@ def build_pe_pct_series(pe_series, hist_df):
             pct = 0.5
         out[str(row["日期_x"])[:10]] = float(pct)
     return out
+
+
+# --------------------------------------------------------------------------
+# 缓存直读（供 UI"启动即用/切换股票"从本地缓存读取，不触发网络请求）
+# 返回的 DataFrame 可能为过期数据，由界面显示更新时间并后台刷新。
+# --------------------------------------------------------------------------
+def read_cached_df_any(key):
+    """读取缓存文件（不过期判定），不存在或损坏返回 None。"""
+    csv_path = _cache_path(key)
+    if not os.path.exists(csv_path):
+        return None
+    try:
+        return pd.read_csv(csv_path, dtype={"日期": str})
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cache_timestamp(key):
+    """返回缓存写入时间戳（epoch 秒），无缓存返回 None。"""
+    meta_path = _cache_meta_path(key)
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("ts")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def hist_cache_key(symbol, period="daily", adjust="qfq", start="", end=""):
+    _, code = normalize_symbol(symbol)
+    return f"hist_{code}_{period}_{adjust}_{start}_{end}"
+
+
+def get_hist_from_cache(symbol, period="daily", adjust="qfq", start="", end=""):
+    """历史K线缓存直读（任意时效），无缓存返回 None。"""
+    return read_cached_df_any(hist_cache_key(symbol, period, adjust, start, end))
+
+
+def get_realtime_from_cache(symbol):
+    """实时行情缓存直读（任意时效），无缓存返回 None。"""
+    sina_code, _ = normalize_symbol(symbol)
+    df = read_cached_df_any(f"realtime_{sina_code}")
+    if df is not None and len(df) > 0:
+        return _parse_rt_lists(df.iloc[0].to_dict())
+    return None
+
+
+def get_valuation_from_cache(symbol, indicator="市盈率(TTM)", period="近一年"):
+    _, code = normalize_symbol(symbol)
+    return read_cached_df_any(f"valuation_{code}_{indicator}_{period}")
+
+
+def get_profile_from_cache(symbol):
+    _, code = normalize_symbol(symbol)
+    df = read_cached_df_any(f"profile_{code}")
+    if df is not None and len(df) > 0:
+        return df.iloc[0].to_dict()
+    return None
+
+
+def get_growth_from_cache(symbol):
+    _, code = normalize_symbol(symbol)
+    df = read_cached_df_any(f"growth_{code}")
+    if df is not None and len(df) > 0:
+        return df.iloc[0].to_dict()
+    return None
+
+
+def get_intraday_from_cache(symbol, scale=1):
+    sina_code, _ = normalize_symbol(symbol)
+    return read_cached_df_any(f"intraday_{sina_code}_{scale}")
+
+
+def delete_stock_cache(symbol):
+    """删除指定股票的全部缓存文件（历史K线/实时/分时/估值/资料/业绩）。"""
+    sina_code, code = normalize_symbol(symbol)
+    prefixes = [f"hist_{code}_", f"realtime_{sina_code}",
+                f"intraday_{sina_code}_", f"valuation_{code}_",
+                f"profile_{code}", f"growth_{code}"]
+    removed = 0
+    for f in os.listdir(config.CACHE_DIR):
+        if not f.endswith((".csv", ".meta.json")):
+            continue
+        base = f.split(".")[0]
+        if any(base.startswith(p) for p in prefixes):
+            try:
+                os.remove(os.path.join(config.CACHE_DIR, f))
+                removed += 1
+            except OSError:
+                pass
+    return removed

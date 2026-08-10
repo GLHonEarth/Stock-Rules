@@ -5,10 +5,18 @@
 运行方式：
     streamlit run app.py
 浏览器访问 http://localhost:8501
+
+交互设计：
+  - 股票库持久化在 data/stock_library.json，跨会话保留
+  - 启动/切换股票时优先读本地缓存（秒开），后台线程自动刷新过期数据
+  - 可一键删除股票（同时清除其本地缓存数据）
 """
 import concurrent.futures as cf
 import os
 import sys
+import threading
+import time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -18,7 +26,7 @@ from plotly.subplots import make_subplots
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core import config, data_fetcher, position, strategies  # noqa: E402
+from core import config, data_fetcher, library, position, strategies  # noqa: E402
 
 PERIOD_MAP = {"日K": "daily", "周K": "weekly", "月K": "monthly"}
 TAG_COLOR = {
@@ -30,14 +38,24 @@ TAG_COLOR = {
     "danger": ("#991b1b", "警示"),
 }
 
+# 后台刷新状态（进程内共享）：code -> "running"/"done"；失败时间戳用于冷却
+REFRESH_FLAGS = {}
+REFRESH_SPAWNED = {}
+REFRESH_FAILED = {}
+
 st.set_page_config(page_title="股票智能技术分析与策略决策系统", layout="wide")
 
 
 # --------------------------------------------------------------------------
-# 数据加载（并行抓取，全部带磁盘缓存与降级）
+# 数据加载：全量抓取 / 缓存优先 / 后台刷新
 # --------------------------------------------------------------------------
-def load_all(query, period):
-    """并行加载一只股票的全部数据，返回 dict；单项失败返回 None 不阻塞整体。"""
+def _fetch_all(code, period_label):
+    """同步全量抓取（首次使用 / 手动刷新按钮触发）。"""
+    return load_all(code, PERIOD_MAP.get(period_label, "daily"))
+
+
+def load_all(code, period):
+    """并行抓取一只股票的全部数据，返回 dict；单项失败返回 None 不阻塞整体。"""
     futures = {}
 
     def _wrap(fn):
@@ -49,8 +67,7 @@ def load_all(query, period):
         return _inner
 
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
-        # 必须先解析代码（阻塞）
-        sina_code, em_code, name = data_fetcher.resolve_symbol(query)
+        sina_code, em_code, name = data_fetcher.resolve_symbol(code)
         common = dict(symbol=em_code)
 
         futures["hist"] = ex.submit(_wrap(lambda: data_fetcher.get_hist(**common, period=period)))
@@ -70,7 +87,102 @@ def load_all(query, period):
         if isinstance(v, tuple) and v and v[0] == "ERR":
             out[k] = None
             out.setdefault("errors", {})[k] = v[1]
+    out["hist_ts"] = time.time()
     return out
+
+
+def _period_key(period_label):
+    return PERIOD_MAP.get(period_label, "daily")
+
+
+def load_cache_first(code, period_label):
+    """
+    缓存优先：只读本地缓存（任意时效，不触发网络），组装渲染所需 dict。
+    若该周期历史K线从未缓存过，返回 None（调用方走全量抓取）。
+    """
+    period = _period_key(period_label)
+    stock = library.get_stock(code) or {}
+    data = {
+        "code": code,
+        "sina_code": data_fetcher.normalize_symbol(code)[0],
+        "name": stock.get("name", ""),
+        "hist": data_fetcher.get_hist_from_cache(code, period),
+        "realtime": data_fetcher.get_realtime_from_cache(code),
+        "pe": data_fetcher.get_valuation_from_cache(code),
+        "pb": data_fetcher.get_valuation_from_cache(code, indicator="市净率"),
+        "profile": data_fetcher.get_profile_from_cache(code),
+        "growth": data_fetcher.get_growth_from_cache(code),
+        "hist_ts": data_fetcher.cache_timestamp(
+            data_fetcher.hist_cache_key(code, period)),
+        "errors": {},
+    }
+    if period_label == "分时":
+        data["intraday"] = data_fetcher.get_intraday_from_cache(code)
+    data["from_cache"] = data["hist"] is not None
+    return data
+
+
+def _is_stale(code, period_label):
+    """判断当前股票对应周期数据是否过期（无缓存或超 TTL）。"""
+    if period_label == "分时":
+        sina = data_fetcher.normalize_symbol(code)[0]
+        key, ttl = f"intraday_{sina}_1", config.CACHE_TTL["intraday"]
+    else:
+        period = _period_key(period_label)
+        key = data_fetcher.hist_cache_key(code, period)
+        ttl_key = {"daily": "hist_daily", "weekly": "hist_week",
+                   "monthly": "hist_month"}[period]
+        ttl = config.CACHE_TTL[ttl_key]
+    ts = data_fetcher.cache_timestamp(key)
+    return ts is None or (time.time() - ts) > ttl
+
+
+def _bg_refresh(code, period_label):
+    """后台线程：抓取最新数据写入磁盘缓存（失败静默，不打断界面）。"""
+    ok = False
+    try:
+        if period_label == "分时":
+            data_fetcher.get_intraday(code)
+        else:
+            data_fetcher.get_hist(code, period=_period_key(period_label))
+            data_fetcher.get_realtime(code)
+        ok = True
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        REFRESH_FLAGS[code] = "done"
+        if not ok:
+            REFRESH_FAILED[code] = time.time()
+
+
+def _maybe_spawn_refresh(code, period_label, has_cache):
+    """缓存过期时启动后台刷新（60s 冷却，失败后 5 分钟内不再重试）。"""
+    if not has_cache or REFRESH_FLAGS.get(code):
+        return
+    if not _is_stale(code, period_label):
+        return
+    now = time.time()
+    if now - REFRESH_SPAWNED.get(code, 0) < 60:
+        return
+    if now - REFRESH_FAILED.get(code, 0) < 300:
+        return
+    REFRESH_SPAWNED[code] = now
+    REFRESH_FLAGS[code] = "running"
+    threading.Thread(target=_bg_refresh, args=(code, period_label), daemon=True).start()
+
+
+@st.fragment(run_every=3)
+def _refresh_watcher(code):
+    """后台刷新完成 → 整体重跑，界面自动更新为新数据。"""
+    if REFRESH_FLAGS.get(code) == "done":
+        REFRESH_FLAGS.pop(code, None)
+        st.rerun()
+
+
+def _fmt_ts(ts):
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
 # --------------------------------------------------------------------------
@@ -98,7 +210,6 @@ def build_kline_chart(df, results, show_n=250):
 
     # ---- 主图：蜡烛 + 均线 + 布林带 ----
     up = chart["收盘"] >= chart["开盘"]
-    colors = np.where(up, "#ef232a", "#14b143")   # 红涨绿跌
     fig.add_trace(go.Candlestick(
         x=chart["日期"], open=chart["开盘"], high=chart["最高"],
         low=chart["最低"], close=chart["收盘"], name="K线",
@@ -244,6 +355,63 @@ def bidask_table(realtime):
     return pd.DataFrame(rows)[["档位", "卖价", "卖量(手)", "买价", "买量(手)"]]
 
 
+def sidebar_library():
+    """
+    侧边栏股票库 UI：
+      - 顶部添加股票（代码/名称）
+      - 股票库下拉切换
+      - 删除当前股票（内联二次确认）
+    返回当前选中的 (code, display_name)。
+    """
+    with st.sidebar:
+        st.header("📁 我的股票库")
+        with st.expander("➕ 添加股票", expanded=True):
+            q = st.text_input("输入股票代码或名称", key="add_q",
+                              placeholder="如 600519 / 贵州茅台")
+            if st.button("添加到股票库", width="stretch", key="btn_add"):
+                if q.strip():
+                    try:
+                        _, em, name = data_fetcher.resolve_symbol(q.strip())
+                        library.add_stock(em, name or q.strip())
+                        st.session_state["added_stock"] = em
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"未找到该股票：{e}")
+                else:
+                    st.warning("请输入股票代码或名称")
+
+        lib = library.load_library()  # 添加后需重载，确保下拉立即包含新股票
+        code, disp = None, ""
+        if lib["stocks"]:
+            labels = [library.display_label(s) for s in lib["stocks"]]
+            default_idx = next((i for i, s in enumerate(lib["stocks"])
+                                if s["code"] == lib["last_viewed"]), 0)
+            idx = st.selectbox("选择查看的股票", range(len(lib["stocks"])),
+                               index=default_idx, format_func=lambda i: labels[i])
+            code = lib["stocks"][idx]["code"]
+            disp = lib["stocks"][idx].get("name") or code
+            library.set_last_viewed(code)
+
+            # 删除股票（内联二次确认）
+            st.divider()
+            if st.session_state.get("confirm_del") != code:
+                if st.button("🗑 删除当前股票", width="stretch", key="btn_del"):
+                    st.session_state["confirm_del"] = code
+                    st.rerun()
+            else:
+                st.warning(f"确认从股票库删除「{disp}」及其本地缓存数据？")
+                c1, c2 = st.columns(2)
+                if c1.button("确认删除", key="btn_del_yes"):
+                    st.session_state.pop("confirm_del", None)
+                    removed = data_fetcher.delete_stock_cache(code)
+                    library.remove_stock(code)
+                    st.session_state["del_msg"] = f"已删除 {disp}，清理缓存 {removed} 个文件"
+                    st.rerun()
+                if c2.button("取消", key="btn_del_no"):
+                    st.session_state.pop("confirm_del", None)
+                    st.rerun()
+        return code, disp
+
+
 # --------------------------------------------------------------------------
 # 主程序
 # --------------------------------------------------------------------------
@@ -251,10 +419,14 @@ def main():
     st.title("📈 股票智能技术分析与策略决策系统")
     st.caption("数据源：东方财富 / 新浪财经 / 百度股市通 / 巨潮资讯（全部免费接口，内置请求限速与缓存）")
 
+    lib = library.load_library()
+
+    # 处理"刚刚添加/删除"的会话消息
+    msg = st.session_state.pop("del_msg", None)
+    if msg:
+        st.toast(msg, icon="🗑")
+
     with st.sidebar:
-        st.header("⚙️ 控制区")
-        query = st.text_input("股票代码或名称", value="600519",
-                              placeholder="如 600519 / sh600519 / 贵州茅台")
         period_label = st.selectbox("时间周期", ["日K", "周K", "月K", "分时"])
         st.subheader("策略开关")
         use_trad = st.checkbox("传统技术面+基本面", value=True)
@@ -264,109 +436,136 @@ def main():
         capital = st.number_input("模拟初始资金（元）", min_value=1000.0, value=100000.0,
                                   step=10000.0, help="用于持仓模拟计算器")
         show_n = st.slider("K线显示数量（根）", 60, 500, 250)
-        if st.button("🔄 强制刷新数据", width="stretch"):
-            for f in os.listdir(config.CACHE_DIR):
-                if f.endswith((".csv", ".meta.json")):
-                    try:
-                        os.remove(os.path.join(config.CACHE_DIR, f))
-                    except OSError:
-                        pass
-            st.rerun()
         st.divider()
         st.warning("⚠️ 本系统所有信号、仓位均为技术分析演示，不构成任何投资建议。"
                    "股市有风险，投资需谨慎。")
 
-    if not query.strip():
-        st.info("请在左侧输入股票代码或名称")
+    code, disp = sidebar_library()
+
+    if not code:
+        st.info("📭 股票库为空。请在左侧输入股票代码或名称，点击「添加到股票库」开始使用。"
+                "添加后数据会自动获取并缓存，下次启动秒开。")
         return
 
-    # ---------- 数据加载 ----------
-    with st.spinner("正在获取行情数据（首次较慢，之后自动走缓存）..."):
-        try:
-            data = load_all(query.strip(), PERIOD_MAP.get(period_label, "daily"))
-        except Exception as e:  # noqa: BLE001
-            st.error(f"数据加载失败：{e}\n\n请检查网络连接（数据源为公开财经接口，偶发限流，"
-                     "可稍后重试或点击左侧「强制刷新数据」）。")
-            return
+    # ---------- 数据加载（缓存优先，秒开） ----------
+    data = load_cache_first(code, period_label)
+    if data["hist"] is None and period_label != "分时":
+        with st.spinner(f"首次获取 {disp}（{code}）的行情数据..."):
+            data = _fetch_all(code, period_label)
+    elif data.get("intraday") is None and period_label == "分时":
+        with st.spinner(f"首次获取 {disp}（{code}）的分时数据..."):
+            try:
+                data["intraday"] = data_fetcher.get_intraday(code)
+                data["hist"] = data_fetcher.get_hist_from_cache(code, "daily") \
+                    or data_fetcher.get_hist(code, period="daily")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"分时数据获取失败：{e}")
 
-    if data.get("hist") is None:
-        st.error("未获取到历史行情数据" + (f"：{data['errors'].get('hist')}" if data.get("errors") else "")
-                 + "\n\n请检查股票代码是否正确、网络是否可用。")
+    # 回填更准确的股票名称（实时行情/公司资料优先，代码输入时也能补全名称）
+    real_name = ((data.get("realtime") or {}).get("名称")
+                 or (data.get("profile") or {}).get("公司名称")
+                 or data.get("name"))
+    library.update_name(code, real_name)
+
+    # 后台刷新过期数据（不阻塞界面）
+    _maybe_spawn_refresh(code, period_label, data.get("from_cache", False))
+
+    # 数据来源提示
+    ts = _fmt_ts(data.get("hist_ts"))
+    stale = _is_stale(code, period_label)
+    if data.get("from_cache") and ts:
+        if stale:
+            st.caption(f"💾 数据来源：本地缓存（更新于 {ts}）｜后台正在自动刷新最新数据...")
+        else:
+            st.caption(f"💾 数据来源：本地缓存（更新于 {ts}）")
+    elif data.get("from_cache"):
+        st.caption("💾 数据来源：本地缓存")
+
+    if data.get("hist") is None and period_label != "分时":
+        st.error("未获取到历史行情数据。请检查网络后点击侧边栏「添加股票」重试，或稍后再试。")
         return
 
-    hist = data["hist"]
-    st.session_state["data"] = data
-    title_name = data.get("name") or f"{data['code']}"
+    # ---------- 渲染仪表盘 ----------
+    render_dashboard(data, code, disp, period_label, capital, show_n,
+                     use_trad, use_mart, use_anti, use_dca)
+
+    # 后台刷新完成自动更新
+    _refresh_watcher(code)
+
+
+def render_dashboard(data, code, disp, period_label, capital, show_n,
+                     use_trad, use_mart, use_anti, use_dca):
+    """主内容区渲染：实时行情 / 信号看板 / K线 / 持仓模拟 / 基本面 / 盘口。"""
+    hist = data.get("hist")
+    rt = data.get("realtime")
+    title_name = data.get("name") or disp or code
 
     # ---------- 顶部：实时行情指标卡 ----------
-    rt = data.get("realtime")
     if rt is not None:
         up_down = "🔴" if rt["涨跌幅"] >= 0 else "🟢"
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric(f"{title_name}（{data['code']}）最新价",
+        c1.metric(f"{title_name}（{code}）最新价",
                   f"{rt['最新价']:.2f}", f"{up_down} {rt['涨跌幅']:+.2f}%",
                   delta_color="normal")
         c2.metric("今开 / 昨收", f"{rt['今开']:.2f} / {rt['昨收']:.2f}")
         c3.metric("最高 / 最低", f"{rt['最高']:.2f} / {rt['最低']:.2f}")
         c4.metric("成交量 / 成交额", f"{rt['成交量(手)']/10000:.1f}万手 / {rt['成交额(元)']/1e8:.2f}亿")
         c5.metric("更新时间", rt["时间戳"])
-    else:
+    elif hist is not None:
         last = hist.iloc[-1]
-        st.info(f"{title_name}（{data['code']}）实时行情暂不可用，以下为最近交易日 "
-                f"{last['日期']} 收盘价 {last['收盘']:.2f}。"
-                + (f"（原因：{data['errors'].get('realtime')}）" if data.get("errors") else ""))
+        st.info(f"{title_name}（{code}）实时行情暂不可用，以下为最近交易日 "
+                f"{last['日期']} 收盘价 {last['收盘']:.2f}。")
+
+    if period_label == "分时":
+        intraday = data.get("intraday")
+        if intraday is None or len(intraday) == 0:
+            st.error("今日暂无分时数据（非交易时段或休市）。")
+            return
+        st.subheader("📈 分时走势")
+        prev_close = (rt or {}).get("昨收", hist["收盘"].iloc[-1] if hist is not None else None)
+        st.plotly_chart(build_intraday_chart(intraday, prev_close), width="stretch")
+        st.caption("💡 支持鼠标拖拽平移、滚轮缩放。")
+        return
 
     # ---------- 信号看板（PRD 4.4） ----------
     st.subheader("📊 当前策略信号看板")
+    pe_series = data.get("pe")
+    pe_pct_map = {}
+    if pe_series is not None and len(pe_series):
+        pe_pct_map = data_fetcher.build_pe_pct_series(pe_series, hist)
+    growth_pct = None
+    if data.get("growth") is not None:
+        growth_pct = data["growth"].get("净利润增长率(%)")
+
+    params = dict(config.STRATEGY_PARAMS)
+    for p in params.values():
+        p["capital"] = capital
+
     enabled = []
-    if period_label == "分时":
-        st.info("分时模式仅展示当日走势；策略信号基于日/周/月 K 线计算，请切换周期查看。")
-    else:
-        pe_series = data.get("pe")
-        pe_pct_map = {}
-        if pe_series is not None:
-            pe_pct_map = data_fetcher.build_pe_pct_series(pe_series, hist)
-        growth_pct = None
-        if data.get("growth") is not None:
-            growth_pct = data["growth"].get("净利润增长率(%)")
+    with st.spinner("策略计算中..."):
+        if use_trad:
+            enabled.append(strategies.run_traditional(hist, pe_pct_map, growth_pct))
+        if use_mart:
+            enabled.append(strategies.run_martingale(hist, params["martingale"]))
+        if use_anti:
+            enabled.append(strategies.run_anti_martingale(hist, params["anti_martingale"]))
+        if use_dca:
+            enabled.append(strategies.run_dca(hist, params["dca"], pe_pct_map))
 
-        params = dict(config.STRATEGY_PARAMS)
-        for p in params.values():
-            p["capital"] = capital
-
-        with st.spinner("策略计算中..."):
-            if use_trad:
-                enabled.append(strategies.run_traditional(hist, pe_pct_map, growth_pct))
-            if use_mart:
-                enabled.append(strategies.run_martingale(hist, params["martingale"]))
-            if use_anti:
-                enabled.append(strategies.run_anti_martingale(hist, params["anti_martingale"]))
-            if use_dca:
-                enabled.append(strategies.run_dca(hist, params["dca"], pe_pct_map))
-
-        cols = st.columns(max(len(enabled), 1))
-        for i, r in enumerate(enabled):
-            cols[i % len(cols)].markdown(status_card(r), unsafe_allow_html=True)
-        warn_msgs = [w for r in enabled for w in r.warnings]
-        if warn_msgs:
-            with st.expander("⚠️ 策略风险提示"):
-                for w in warn_msgs:
-                    st.warning(w)
+    cols = st.columns(max(len(enabled), 1))
+    for i, r in enumerate(enabled):
+        cols[i % len(cols)].markdown(status_card(r), unsafe_allow_html=True)
+    warn_msgs = [w for r in enabled for w in r.warnings]
+    if warn_msgs:
+        with st.expander("⚠️ 策略风险提示"):
+            for w in warn_msgs:
+                st.warning(w)
 
     # ---------- 核心图表区 ----------
     st.subheader("📈 核心图表区")
-    if period_label == "分时":
-        try:
-            intraday = data_fetcher.get_intraday(data["code"])
-            prev_close = (rt or {}).get("昨收", hist["收盘"].iloc[-1])
-            st.plotly_chart(build_intraday_chart(intraday, prev_close),
-                            width="stretch")
-        except Exception as e:  # noqa: BLE001
-            st.error(f"分时数据获取失败：{e}")
-    else:
-        fig = build_kline_chart(hist, enabled, show_n=show_n)
-        st.plotly_chart(fig, width="stretch")
-        st.caption("💡 支持鼠标拖拽平移、滚轮缩放；▲绿箭头=买点，▼红箭头=卖点，悬停查看具体原因。")
+    fig = build_kline_chart(hist, enabled, show_n=show_n)
+    st.plotly_chart(fig, width="stretch")
+    st.caption("💡 支持鼠标拖拽平移、滚轮缩放；▲绿箭头=买点，▼红箭头=卖点，悬停查看具体原因。")
 
     # ---------- 最近信号表 ----------
     if enabled:
@@ -387,16 +586,16 @@ def main():
         with st.expander("📉 各策略历史盈亏率曲线（回测）"):
             curves = position.latest_positions_series(enabled, last_close)
             if len(curves):
-                fig = go.Figure()
+                fig2 = go.Figure()
                 for col in curves.columns:
                     if col != "日期":
-                        fig.add_trace(go.Scatter(
+                        fig2.add_trace(go.Scatter(
                             x=curves["日期"], y=curves[col], name=col,
                             line=dict(width=1.3)))
-                fig.add_hline(y=0, line_color="#64748b", line_dash="dash")
-                fig.update_layout(height=360, margin=dict(l=40, r=20, t=30, b=30),
-                                  legend=dict(orientation="h", y=1.05))
-                st.plotly_chart(fig, width="stretch")
+                fig2.add_hline(y=0, line_color="#64748b", line_dash="dash")
+                fig2.update_layout(height=360, margin=dict(l=40, r=20, t=30, b=30),
+                                   legend=dict(orientation="h", y=1.05))
+                st.plotly_chart(fig2, width="stretch")
 
     # ---------- 基本面数据卡片（PRD 4.4） ----------
     st.subheader("🏷️ 基本面数据卡片")
@@ -431,7 +630,7 @@ def main():
 
     st.divider()
     st.caption("数据更新策略：实时行情 20 秒缓存 · 日K 20 分钟 · 估值/财务 12~24 小时。"
-               "所有接口均为免费公开数据源，若遇限流系统会自动重试并降级。")
+               "启动或切换股票时优先读本地缓存，后台自动刷新过期数据。")
 
 
 if __name__ == "__main__":
