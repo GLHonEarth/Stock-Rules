@@ -12,6 +12,7 @@
   - 可一键删除股票（同时清除其本地缓存数据）
 """
 import concurrent.futures as cf
+import copy
 import os
 import sys
 import threading
@@ -37,6 +38,26 @@ TAG_COLOR = {
     "neutral": ("#2563eb", "中性"),
     "danger": ("#991b1b", "警示"),
 }
+
+# 策略状态 -> 中文短标签
+TAG_CN = {
+    "bull": "看多",
+    "bear": "看空",
+    "hold": "持有",
+    "wait": "等待",
+    "neutral": "中性",
+    "danger": "警示",
+}
+# 综合分类颜色
+CAT_COLOR = {
+    "看多": "#16a34a",
+    "观望": "#64748b",
+    "看空": "#dc2626",
+    "警示": "#f59e0b",
+    "数据异常": "#991b1b",
+}
+# 综合信号计分：bull+1 / bear-1 / danger-2 / 其余 0
+TAG_WEIGHT = {"bull": 1, "bear": -1, "hold": 0, "wait": 0, "neutral": 0, "danger": -2}
 
 # 后台刷新状态（进程内共享）：code -> "running"/"done"；失败时间戳用于冷却
 REFRESH_FLAGS = {}
@@ -504,6 +525,151 @@ def sidebar_library():
 
 
 # --------------------------------------------------------------------------
+# 股票库：一键更新全部数据 / 按策略信号分类总览
+# --------------------------------------------------------------------------
+def update_library_data(stocks):
+    """
+    一键更新股票库全部股票数据（日K/实时/估值/财务），写入本地缓存。
+    返回失败列表 [(code, err)]。
+    """
+    n = len(stocks)
+    if n == 0:
+        return []
+    progress = st.progress(0.0, text="准备更新...")
+    errors = []
+    for i, s in enumerate(stocks):
+        progress.progress(i / n, text=f"正在更新 {i + 1}/{n}：{s['name']}（{s['code']}）...")
+        try:
+            load_all(s["code"], "daily")   # 全量抓取并写入缓存
+        except Exception as e:  # noqa: BLE001
+            errors.append((s["code"], str(e)[:80]))
+    progress.progress(1.0, text="更新完成")
+    progress.empty()
+    return errors
+
+
+def _stock_data_for_overview(s):
+    """
+    为总览页计算单只股票的四策略状态（缓存优先，仅缺失时抓取）。
+    返回 dict：code/name/price/tags/score/cat/err。
+    """
+    code, name = s["code"], s.get("name") or s["code"]
+    try:
+        hist = data_fetcher.get_hist_from_cache(code, "daily")
+        if hist is None:
+            hist = data_fetcher.get_hist(code, period="daily")
+        pe = data_fetcher.get_valuation_from_cache(code)
+        if pe is None:
+            pe = data_fetcher.get_valuation(code)
+        growth = data_fetcher.get_growth_from_cache(code)
+        if growth is None:
+            growth = data_fetcher.get_growth(code)
+        rt = data_fetcher.get_realtime_from_cache(code)
+        price = rt["最新价"] if rt else (
+            float(hist["收盘"].iloc[-1]) if hist is not None else None)
+        pe_map = (data_fetcher.build_pe_pct_series(pe, hist)
+                  if pe is not None and hist is not None else {})
+        growth_pct = growth.get("净利润增长率(%)") if growth else None
+
+        params = copy.deepcopy(config.STRATEGY_PARAMS)
+        trad = strategies.run_traditional(hist, pe_map, growth_pct)
+        mart = strategies.run_martingale(hist, params["martingale"])
+        anti = strategies.run_anti_martingale(hist, params["anti_martingale"])
+        dca = strategies.run_dca(hist, params["dca"], pe_map)
+
+        tags = {"传统指标": trad.status_tag, "马丁策略": mart.status_tag,
+                "反马丁": anti.status_tag, "定投策略": dca.status_tag}
+        score = sum(TAG_WEIGHT.get(t, 0) for t in tags.values())
+        if any(t == "danger" for t in tags.values()):
+            cat = "警示"
+        elif score > 0:
+            cat = "看多"
+        elif score < 0:
+            cat = "看空"
+        else:
+            cat = "观望"
+        return {"code": code, "name": name, "price": price,
+                "tags": tags, "score": score, "cat": cat, "err": ""}
+    except Exception as e:  # noqa: BLE001
+        return {"code": code, "name": name, "price": None,
+                "tags": {}, "score": 0, "cat": "数据异常", "err": str(e)[:80]}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _overview_data(stocks):
+    """股票库总览数据（缓存 5 分钟；一键更新后自动失效）。"""
+    return [_stock_data_for_overview(s) for s in stocks]
+
+
+def _stock_card_html(r):
+    """单只股票的总览卡片（HTML）。"""
+    price = f"{r['price']:.2f}" if r.get("price") else "—"
+    cat_color = CAT_COLOR.get(r["cat"], "#94a3b8")
+    labels = [("传统", "传统指标"), ("马丁", "马丁策略"),
+              ("反马丁", "反马丁"), ("定投", "定投策略")]
+    tags_html = "　".join(
+        f"<span style='color:{TAG_COLOR.get(r['tags'].get(k, ''), ('#94a3b8', ''))[0]}'>"
+        f"{lbl}:{TAG_CN.get(r['tags'].get(k, ''), '?')}</span>"
+        for lbl, k in labels)
+    return f"""
+    <div style="border:1px solid {cat_color};border-radius:8px;background:#0f172a;
+                padding:10px 14px;min-width:210px;flex:1 1 210px;">
+      <div style="font-size:15px;font-weight:700;">{r['name']}
+        <span style="color:#94a3b8;font-weight:400;">{r['code']}</span>
+        <span style="float:right;color:{cat_color};font-weight:800;">{r['cat']}</span></div>
+      <div style="font-size:22px;font-weight:800;margin:4px 0;color:#e2e8f0;">{price}</div>
+      <div style="font-size:13px;color:#94a3b8;">{tags_html}</div>
+    </div>"""
+
+
+def render_library_overview(stocks):
+    """股票库总览页：按当前策略信号综合分类展示全部股票。"""
+    st.subheader("📋 股票库总览 · 按策略信号分类")
+    st.caption("综合信号 = 传统/马丁/反马丁/定投 四策略状态汇总（看多+1、看空-1、马丁警示-2）。"
+               "基于本地缓存计算，点左侧「🔄 一键更新股票库数据」获取最新。")
+    if not stocks:
+        st.info("股票库为空，请在左侧添加股票。")
+        return
+
+    with st.spinner("正在计算各股票策略信号..."):
+        rows = _overview_data(stocks)
+
+    # ---- 统计条 ----
+    cnt = {}
+    for r in rows:
+        cnt[r["cat"]] = cnt.get(r["cat"], 0) + 1
+    st.markdown(
+        f"📗 看多 **{cnt.get('看多', 0)}** 只　📙 观望 **{cnt.get('观望', 0)}** 只　"
+        f"📕 看空 **{cnt.get('看空', 0)}** 只　⚠️ 警示 **{cnt.get('警示', 0)}** 只　"
+        f"❌ 数据异常 **{cnt.get('数据异常', 0)}** 只")
+
+    # ---- 策略状态矩阵表 ----
+    df = pd.DataFrame([{
+        "股票": f"{r['name']}（{r['code']}）",
+        "最新价": round(r["price"], 2) if r.get("price") else None,
+        "传统指标": TAG_CN.get(r["tags"].get("传统指标", ""), "?"),
+        "马丁策略": TAG_CN.get(r["tags"].get("马丁策略", ""), "?"),
+        "反马丁": TAG_CN.get(r["tags"].get("反马丁", ""), "?"),
+        "定投策略": TAG_CN.get(r["tags"].get("定投策略", ""), "?"),
+        "综合": r["cat"],
+    } for r in rows])
+    st.dataframe(df, width="stretch", hide_index=True)
+
+    # ---- 按分类分组展示卡片 ----
+    for cat in ("看多", "观望", "看空", "警示", "数据异常"):
+        group = [r for r in rows if r["cat"] == cat]
+        if not group:
+            continue
+        ccolor = CAT_COLOR.get(cat, "#94a3b8")
+        st.markdown(f"### <span style='color:{ccolor};font-size:18px;'>"
+                    f"{cat}（{len(group)} 只）</span>", unsafe_allow_html=True)
+        cards = "".join(_stock_card_html(r) for r in group)
+        st.markdown(
+            f'<div style="display:flex;flex-wrap:wrap;gap:10px;">{cards}</div>',
+            unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------
 # 主程序
 # --------------------------------------------------------------------------
 def main():
@@ -512,10 +678,13 @@ def main():
 
     lib = library.load_library()
 
-    # 处理"刚刚添加/删除"的会话消息
+    # 处理"刚刚添加/删除/一键更新"的会话消息
     msg = st.session_state.pop("del_msg", None)
     if msg:
         st.toast(msg, icon="🗑")
+    msg2 = st.session_state.pop("update_msg", None)
+    if msg2:
+        st.toast(msg2, icon="🔄")
 
     with st.sidebar:
         period_label = st.selectbox("时间周期", ["日K", "周K", "月K", "分时"])
@@ -532,6 +701,27 @@ def main():
                    "股市有风险，投资需谨慎。")
 
     code, disp = sidebar_library()
+
+    # 一键更新股票库全部数据（进度显示，完成后自动刷新）
+    with st.sidebar:
+        st.divider()
+        if st.button("🔄 一键更新股票库数据", width="stretch", key="btn_update_all",
+                     help="重新抓取股票库中全部股票的行情/估值/财务数据并写入本地缓存，"
+                          "让「股票库总览」反映最新信号。"):
+            stocks_all = library.load_library()["stocks"]
+            if stocks_all:
+                errs = update_library_data(stocks_all)
+                try:
+                    _overview_data.clear()
+                except Exception:  # noqa: BLE001
+                    pass
+                n_ok = len(stocks_all) - len(errs)
+                st.session_state["update_msg"] = (
+                    f"已更新 {n_ok}/{len(stocks_all)} 只股票数据"
+                    + (f"，{len(errs)} 只失败：{errs[0][0]}" if errs else ""))
+            else:
+                st.session_state["update_msg"] = "股票库为空，无需更新"
+            st.rerun()
 
     if not code:
         st.info("📭 股票库为空。请在左侧输入股票代码或名称，点击「添加到股票库」开始使用。"
@@ -576,9 +766,13 @@ def main():
         st.error("未获取到历史行情数据。请检查网络后点击侧边栏「添加股票」重试，或稍后再试。")
         return
 
-    # ---------- 渲染仪表盘 ----------
-    render_dashboard(data, code, disp, period_label, capital, show_n,
-                     use_trad, use_mart, use_anti, use_dca)
+    # ---------- 渲染：个股分析 / 股票库总览 ----------
+    tab_analysis, tab_overview = st.tabs(["📈 个股分析", "📋 股票库总览"])
+    with tab_analysis:
+        render_dashboard(data, code, disp, period_label, capital, show_n,
+                         use_trad, use_mart, use_anti, use_dca)
+    with tab_overview:
+        render_library_overview(library.load_library()["stocks"])
 
     # 后台刷新完成自动更新
     _refresh_watcher(code)

@@ -6,6 +6,7 @@
   3. 删除股票（从库中移除 + 清理缓存文件）
 运行：python test_offline.py
 """
+import json
 import os
 import sys
 import time
@@ -22,6 +23,24 @@ FAKE = [
     ("123456", "测试一号"),
     ("654321", "测试二号"),
 ]
+
+# 测试前后备份/恢复真实股票库，避免污染用户数据
+_LIB_BACKUP = None
+
+
+def backup_real_library():
+    global _LIB_BACKUP
+    try:
+        if os.path.exists(library.LIBRARY_PATH):
+            with open(library.LIBRARY_PATH, "r", encoding="utf-8") as f:
+                _LIB_BACKUP = json.load(f)
+    except Exception:  # noqa: BLE001
+        _LIB_BACKUP = None
+
+
+def restore_real_library():
+    if _LIB_BACKUP is not None:
+        library.save_library(_LIB_BACKUP)
 
 
 def make_hist(seed=1):
@@ -59,6 +78,7 @@ def reset_state():
 
 
 def main():
+    backup_real_library()
     reset_state()
     # 建立股票库
     for code, name in FAKE:
@@ -104,6 +124,7 @@ def main():
 
     print("\n🎉 离线验证全部通过")
     reset_state()
+    restore_real_library()
 
 
 if __name__ == "__main__":
