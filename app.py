@@ -362,14 +362,18 @@ def status_card(result):
 
 def bidask_table(realtime):
     """五档盘口表：上为卖五→卖一，下为买一→买五。"""
+    asks = realtime.get("卖盘") or []
+    bids = realtime.get("买盘") or []
     rows = []
     for i in range(4, -1, -1):
-        vol, price = realtime["卖盘"][i]
+        item = asks[i] if i < len(asks) else (0, 0)
+        vol, price = (item[0], item[1]) if len(item) == 2 else (0, 0)
         rows.append({"档位": ["卖五", "卖四", "卖三", "卖二", "卖一"][i],
                      "卖价": price, "卖量(手)": int(vol),
                      "买价": np.nan, "买量(手)": np.nan})
     for i in range(5):
-        vol, price = realtime["买盘"][i]
+        item = bids[i] if i < len(bids) else (0, 0)
+        vol, price = (item[0], item[1]) if len(item) == 2 else (0, 0)
         rows.append({"档位": ["买一", "买二", "买三", "买四", "买五"][i],
                      "卖价": np.nan, "卖量(手)": np.nan,
                      "买价": price, "买量(手)": int(vol)})
@@ -428,11 +432,24 @@ def quote_header_html(rt, name, code):
     顶部实时行情栏（HTML，flex 自动换行，任何窗口宽度下均完整显示）。
     价格红涨绿跌；更新时间精确到秒并以醒目颜色展示。
     """
-    price = rt["最新价"]
-    chg = rt["涨跌幅"]
+    # 防御性读取：历史缓存字段可能缺失/异常，缺省不崩溃
+    def _g(k, d=0.0):
+        v = rt.get(k, d)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return d
+
+    price = _g("最新价")
+    chg = _g("涨跌幅")
+    chg_amt = _g("涨跌额")
     up = chg >= 0
     color = "#ef4444" if up else "#22c55e"
     arrow = "▲" if up else "▼"
+    opn, prev = _g("今开"), _g("昨收")
+    hi, lo = _g("最高"), _g("最低")
+    vol, amt = _g("成交量(手)"), _g("成交额(元)")
+    ts = rt.get("时间戳", "") if isinstance(rt.get("时间戳", ""), str) else ""
     return f"""
     <div style="display:flex;flex-wrap:wrap;gap:12px 36px;align-items:center;
                 background:#0f172a;border:1px solid #1e293b;border-radius:10px;
@@ -441,27 +458,27 @@ def quote_header_html(rt, name, code):
         <div style="font-size:16px;color:#94a3b8;">{name}（{code}）· 最新价</div>
         <span style="font-size:40px;font-weight:800;color:{color};">{price:.2f}</span>
         <span style="margin-left:12px;font-size:22px;font-weight:800;color:{color};">{arrow} {chg:+.2f}%</span>
-        <span style="margin-left:10px;font-size:16px;color:#94a3b8;">涨跌额 {rt['涨跌额']:+.2f}</span>
+        <span style="margin-left:10px;font-size:16px;color:#94a3b8;">涨跌额 {chg_amt:+.2f}</span>
       </div>
       <div>
         <div style="font-size:15px;color:#94a3b8;">今开 / 昨收</div>
-        <div style="font-size:21px;font-weight:700;">{rt['今开']:.2f} / {rt['昨收']:.2f}</div>
+        <div style="font-size:21px;font-weight:700;">{opn:.2f} / {prev:.2f}</div>
       </div>
       <div>
         <div style="font-size:15px;color:#94a3b8;">最高 / 最低</div>
-        <div style="font-size:21px;font-weight:700;">{rt['最高']:.2f} / {rt['最低']:.2f}</div>
+        <div style="font-size:21px;font-weight:700;">{hi:.2f} / {lo:.2f}</div>
       </div>
       <div>
         <div style="font-size:15px;color:#94a3b8;">成交量</div>
-        <div style="font-size:21px;font-weight:700;">{_fmt_vol(rt['成交量(手)'])}</div>
+        <div style="font-size:21px;font-weight:700;">{_fmt_vol(vol)}</div>
       </div>
       <div>
         <div style="font-size:15px;color:#94a3b8;">成交额</div>
-        <div style="font-size:21px;font-weight:700;">{_fmt_amount(rt['成交额(元)'])}</div>
+        <div style="font-size:21px;font-weight:700;">{_fmt_amount(amt)}</div>
       </div>
       <div>
         <div style="font-size:15px;color:#94a3b8;">数据更新时间</div>
-        <div style="font-size:21px;font-weight:800;color:#facc15;">{_fmt_update_time(rt['时间戳'])}</div>
+        <div style="font-size:21px;font-weight:800;color:#facc15;">{_fmt_update_time(ts)}</div>
       </div>
     </div>
     """
@@ -550,7 +567,10 @@ def update_library_data(stocks):
 
 def _stock_data_for_overview(s):
     """
-    为总览页计算单只股票的四策略状态（缓存优先，仅缺失时抓取）。
+    为总览页计算单只股票的四策略状态。
+    性能策略：仅读本地缓存（秒开，绝不联网拖慢页面）；
+    仅当历史K线从未缓存过时，才对这只股票抓取一次日K。
+    估值/财务缺失时显示"—"，可用「一键更新股票库数据」补齐。
     返回 dict：code/name/price/tags/score/cat/err。
     """
     code, name = s["code"], s.get("name") or s["code"]
@@ -558,13 +578,9 @@ def _stock_data_for_overview(s):
         hist = data_fetcher.get_hist_from_cache(code, "daily")
         if hist is None:
             hist = data_fetcher.get_hist(code, period="daily")
-        pe = data_fetcher.get_valuation_from_cache(code)
-        if pe is None:
-            pe = data_fetcher.get_valuation(code)
-        growth = data_fetcher.get_growth_from_cache(code)
-        if growth is None:
-            growth = data_fetcher.get_growth(code)
-        rt = data_fetcher.get_realtime_from_cache(code)
+        pe = data_fetcher.get_valuation_from_cache(code)          # 纯缓存
+        growth = data_fetcher.get_growth_from_cache(code)          # 纯缓存
+        rt = data_fetcher.get_realtime_from_cache(code)            # 纯缓存
         price = rt["最新价"] if rt else (
             float(hist["收盘"].iloc[-1]) if hist is not None else None)
         pe_map = (data_fetcher.build_pe_pct_series(pe, hist)
@@ -697,6 +713,9 @@ def main():
                                   step=10000.0, help="用于持仓模拟计算器")
         show_n = st.slider("K线显示数量（根）", 60, 500, 250)
         st.divider()
+        view = st.radio("视图", ["📈 个股分析", "📋 股票库总览"],
+                        horizontal=True, help="「股票库总览」仅在打开时才计算，不拖慢个股页")
+        st.divider()
         st.warning("⚠️ 本系统所有信号、仓位均为技术分析演示，不构成任何投资建议。"
                    "股市有风险，投资需谨慎。")
 
@@ -766,13 +785,12 @@ def main():
         st.error("未获取到历史行情数据。请检查网络后点击侧边栏「添加股票」重试，或稍后再试。")
         return
 
-    # ---------- 渲染：个股分析 / 股票库总览 ----------
-    tab_analysis, tab_overview = st.tabs(["📈 个股分析", "📋 股票库总览"])
-    with tab_analysis:
+    # ---------- 渲染（惰性加载：仅渲染所选视图，避免总览拖慢个股页） ----------
+    if view == "📋 股票库总览":
+        render_library_overview(library.load_library()["stocks"])
+    else:
         render_dashboard(data, code, disp, period_label, capital, show_n,
                          use_trad, use_mart, use_anti, use_dca)
-    with tab_overview:
-        render_library_overview(library.load_library()["stocks"])
 
     # 后台刷新完成自动更新
     _refresh_watcher(code)
@@ -855,12 +873,14 @@ def render_dashboard(data, code, disp, period_label, capital, show_n,
                 st.info("所选周期与策略范围内暂无信号。")
 
     # ---------- 持仓模拟计算器（PRD 4.4） ----------
-    if enabled:
+    last_close = float(hist["收盘"].iloc[-1])
+    pos_df = position.position_table(enabled, last_close) if enabled else pd.DataFrame()
+    if len(pos_df):
         st.subheader("💰 持仓模拟计算器")
-        last_close = float(hist["收盘"].iloc[-1])
-        st.dataframe(position.position_table(enabled, last_close),
-                     width="stretch", hide_index=True)
-        with st.expander("📉 各策略历史盈亏率曲线（回测）"):
+        st.caption("累计口径：马丁/反马丁以「初始资金」为基准，定投以「累计投入」为基准；"
+                   "总权益已包含历次平仓落袋的利润，与买卖信号一一对应。")
+        st.dataframe(pos_df, width="stretch", hide_index=True)
+        with st.expander("📉 各策略累计收益率曲线（回测）"):
             curves = position.latest_positions_series(enabled, last_close)
             if len(curves):
                 fig2 = go.Figure()

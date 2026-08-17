@@ -61,7 +61,7 @@ def main():
         if len(r.positions):
             last = r.positions.iloc[-1]
             print(f"        当前持仓: {last['持仓数']:.0f}股 成本{last['成本价']:.2f} "
-                  f"盈亏{last['盈亏率%']:.2f}%")
+                  f"累计收益率{last['收益率%']:.2f}% 总权益{last['权益']:.0f}")
 
     print("\n8) 信号合并")
     sig = strategies.merge_signals(results)

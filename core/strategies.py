@@ -35,25 +35,67 @@ class StrategyResult:
     status_tag: str = "neutral"      # bull / bear / neutral / hold / wait / danger
     metrics: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
+    capital: float = 0.0            # 初始资金（马丁/反马丁，用于累计收益率计算）
+    total_invest: float = 0.0       # 累计投入（定投，用于累计收益率计算）
+    _rows: list = field(default_factory=list, repr=False, init=False)
 
     def add_signal(self, date, price, action, reason):
-        self.signals = pd.concat([
-            self.signals,
-            pd.DataFrame([{"日期": date, "价格": price, "方向": action, "原因": reason}])
-        ], ignore_index=True)
+        # 先追加到列表，最后一次性建表，避免逐条 pd.concat 的 O(n^2) 开销
+        self._rows.append({"日期": date, "价格": price, "方向": action, "原因": reason})
+
+    def finalize_signals(self):
+        """把累积的信号行转为 DataFrame 并返回。"""
+        if self._rows:
+            self.signals = pd.DataFrame(self._rows)
+            self._rows = []
+        return self.signals
+
+    @property
+    def n_buy(self):
+        return sum(1 for r in self._rows if r["方向"] == "buy")
+
+    @property
+    def n_sell(self):
+        return sum(1 for r in self._rows if r["方向"] == "sell")
 
     def summarize_metrics(self, last_close):
+        """
+        汇总当前持仓摘要。收益率按累计口径计算：
+          - 马丁/反马丁（设置了 capital）：累计收益率 = (总权益 - 初始资金) / 初始资金
+          - 定投（未设置 capital）：收益率 = (市值 - 投入) / 投入
+        这样平仓落袋的利润（体现在可用资金里）也计入结果，与买卖信号一一对应。
+        """
         if len(self.positions) == 0:
             return
         p = self.positions.iloc[-1]
+        shares = float(p["持仓数"])
+        value = float(p["市值"])
+        cash = float(p["可用资金"])
+        invest = float(p["投入资金"])
+        equity = float(p.get("权益", value + cash))
+        cost = float(p["成本价"]) if shares > 0 else 0.0
+        if self.capital and self.capital > 0:
+            base = self.capital
+        elif self.total_invest and self.total_invest > 0:
+            base = self.total_invest
+        else:
+            base = 0.0
+        if base > 0:
+            pnl_amount = equity - base
+            pnl_pct = pnl_amount / base * 100
+        else:
+            pnl_amount = value - invest
+            pnl_pct = (value / invest - 1) * 100 if invest > 0 else 0.0
         self.metrics = {
-            "shares": float(p["持仓数"]),
-            "cost": float(p["成本价"]) if p["持仓数"] > 0 else 0.0,
-            "invest": float(p["投入资金"]),
-            "value": float(p["市值"]),
-            "pnl_pct": float(p["盈亏率%"]),
-            "pnl_amount": float(p["市值"] - p["成本价"] * p["持仓数"]),
-            "cash": float(p["可用资金"]),
+            "shares": shares,
+            "cost": cost,
+            "invest": invest,
+            "value": value,
+            "cash": cash,
+            "equity": equity,
+            "pnl_pct": float(pnl_pct),
+            "pnl_amount": float(pnl_amount),
+            "position_ratio": (value / equity * 100) if equity > 0 else 0.0,
         }
 
 
@@ -109,8 +151,7 @@ def run_traditional(df, pe_pct_map=None, growth_pct=None):
         res.add_signal(last["日期"], last["收盘"], "sell", "基本面:" + ";".join(votes["sell"]))
 
     # --- 综合状态：买卖票数对比 ---
-    buy_n, sell_n = len(res.signals[res.signals["方向"] == "buy"]), \
-        len(res.signals[res.signals["方向"] == "sell"])
+    buy_n, sell_n = res.n_buy, res.n_sell
     if buy_n > sell_n:
         res.status = f"看多（买点{buy_n} > 卖点{sell_n}）"
         res.status_tag = "bull"
@@ -121,6 +162,7 @@ def run_traditional(df, pe_pct_map=None, growth_pct=None):
         res.status = "中性（买卖信号均衡，观望为主）"
         res.status_tag = "neutral"
 
+    res.finalize_signals()
     res.summarize_metrics(df["收盘"].iloc[-1])
     return res
 
@@ -146,6 +188,7 @@ def run_martingale(df, params):
     init_ratio = float(params["init_ratio"])
 
     res = StrategyResult(name="马丁策略")
+    res.capital = capital
     res.warnings.append(
         "⚠️ 马丁策略在单边下跌行情中资金消耗呈指数级增长，极易爆仓。"
         f"本系统已强制设置：最大加仓次数 {max_adds} 次、总资金止损线 {stop_loss*100:.0f}%。")
@@ -160,22 +203,23 @@ def run_martingale(df, params):
     cycle = 0             # 建仓-平仓周期计数
     stopped = False
     rows = []
-    signals_in_cycle = 0  # 避免同一根K线重复打点
+
+    def _snapshot():
+        equity = cash + shares * close
+        return (date, shares, cost, invest, shares * close, cash, equity)
 
     for i, bar in df.iterrows():
         date, close = bar["日期"], float(bar["收盘"])
 
         if stopped:
-            rows.append((date, shares, cost, invest, shares * close, cash))
+            rows.append(_snapshot())
             continue
 
         # --- 建仓：空仓时在当期收盘价买入初始仓位 ---
         if shares <= 0:
-            if signals_in_cycle > 0:
-                signals_in_cycle = 0
             amount = cash * init_ratio
             if amount <= 0 or close <= 0:
-                rows.append((date, 0, 0, 0, 0, cash))
+                rows.append(_snapshot())
                 continue
             shares = amount / close
             cost = close
@@ -228,33 +272,35 @@ def run_martingale(df, params):
             res.status = f"已触发止损（-{stop_loss*100:.0f}%），交易已停止，建议观望"
             res.status_tag = "danger"
 
-        rows.append((date, shares, cost, invest, shares * close, cash))
+        rows.append(_snapshot())
 
     res.positions = pd.DataFrame(
-        rows, columns=["日期", "持仓数", "成本价", "投入资金", "市值", "可用资金"])
-    res.positions["盈亏率%"] = np.where(
-        res.positions["投入资金"] > 0,
-        (res.positions["市值"] - res.positions["投入资金"]) / res.positions["投入资金"] * 100,
+        rows, columns=["日期", "持仓数", "成本价", "投入资金", "市值", "可用资金", "权益"])
+    res.positions["收益率%"] = np.where(
+        res.positions["权益"] > 0,
+        (res.positions["权益"] - capital) / capital * 100,
         0.0)
     res.positions["成本价"] = res.positions["成本价"].replace(0, np.nan)
 
-    # --- 当前状态 ---
+    # --- 当前状态（累计口径） ---
     last = res.positions.iloc[-1]
+    total_ret = float(last["收益率%"])
     if last["持仓数"] <= 0:
         if not stopped:
-            res.status = "空仓，等待首次建仓"
+            res.status = (f"空仓（累计{'+' if total_ret >= 0 else ''}{total_ret:.1f}%），"
+                          f"等待{'下一轮' if cycle > 0 else '首次'}建仓")
             res.status_tag = "wait"
     else:
-        pnl = last["盈亏率%"]
-        if pnl < 0:
-            res.status = f"持有中（浮亏{pnl:.1f}%），等待加仓/止损"
+        if total_ret < 0:
+            res.status = f"持有中（累计{total_ret:.1f}%），等待加仓/止损"
             res.status_tag = "hold"
         else:
-            res.status = f"持有中（盈利{pnl:.1f}%），接近目标微利"
+            res.status = f"持有中（累计{total_ret:+.1f}%），接近目标微利"
             res.status_tag = "bull"
     if adds == max_adds and last["持仓数"] > 0:
         res.status += "｜⚠️已达最大加仓次数"
 
+    res.finalize_signals()
     res.summarize_metrics(df["收盘"].iloc[-1])
     return res
 
@@ -271,6 +317,7 @@ def run_anti_martingale(df, params):
     lookback = int(params["lookback"])
 
     res = StrategyResult(name="反马丁策略")
+    res.capital = capital
     df = ind.add_all(df)
 
     cash = capital
@@ -281,6 +328,10 @@ def run_anti_martingale(df, params):
     adds = 0
     entry_price = 0.0
     rows = []
+
+    def _snapshot():
+        equity = cash + shares * close
+        return (date, shares, cost, invest, shares * close, cash, equity)
 
     # 均线多头排列（MA5>MA10>MA20）
     bull_align = (df["MA5"] > df["MA10"]) & (df["MA10"] > df["MA20"]) & df["MA20"].notna()
@@ -336,25 +387,27 @@ def run_anti_martingale(df, params):
                 cash += shares * close
                 shares, cost, invest, last_amount, adds, entry_price = 0, 0, 0, 0, 0, 0
 
-        rows.append((date, shares, cost, invest, shares * close, cash))
+        rows.append(_snapshot())
 
     res.positions = pd.DataFrame(
-        rows, columns=["日期", "持仓数", "成本价", "投入资金", "市值", "可用资金"])
-    res.positions["盈亏率%"] = np.where(
-        res.positions["投入资金"] > 0,
-        (res.positions["市值"] - res.positions["投入资金"]) / res.positions["投入资金"] * 100,
+        rows, columns=["日期", "持仓数", "成本价", "投入资金", "市值", "可用资金", "权益"])
+    res.positions["收益率%"] = np.where(
+        res.positions["权益"] > 0,
+        (res.positions["权益"] - capital) / capital * 100,
         0.0)
     res.positions["成本价"] = res.positions["成本价"].replace(0, np.nan)
 
     last = res.positions.iloc[-1]
+    total_ret = float(last["收益率%"])
     if last["持仓数"] <= 0:
-        res.status = "空仓，等待均线多头排列（顺势建仓）"
+        res.status = f"空仓（累计{'+' if total_ret >= 0 else ''}{total_ret:.1f}%），等待均线多头排列"
         res.status_tag = "wait"
     else:
-        pnl = last["盈亏率%"]
-        res.status = f"持仓中（{('盈利' if pnl >= 0 else '浮亏')}{pnl:.1f}%），顺势持有，止损线{stop_loss*100:.0f}%"
-        res.status_tag = "bull" if pnl >= 0 else "hold"
+        res.status = (f"持仓中（累计{'+' if total_ret >= 0 else ''}{total_ret:.1f}%），"
+                      f"顺势持有，止损线{stop_loss*100:.0f}%")
+        res.status_tag = "bull" if total_ret >= 0 else "hold"
     res.warnings.append("反马丁策略适合单边上涨趋势，震荡行情中会频繁止损，需配合趋势过滤器使用。")
+    res.finalize_signals()
     res.summarize_metrics(df["收盘"].iloc[-1])
     return res
 
@@ -375,11 +428,18 @@ def run_dca(df, params, pe_pct_map=None):
 
     shares = 0.0
     cost = 0.0          # 加权平均成本
-    invest = 0.0        # 累计投入
+    invest = 0.0        # 持仓成本（随买卖变化）
+    total_invest = 0.0  # 累计投入（所有买入金额之和）
+    realized = 0.0      # 落袋现金（历次止盈卖出所得）
     sold_half = False   # 是否已完成首次分批止盈
     rows = []
     last_mult = 1.0
     last_status_note = ""
+
+    def _snapshot():
+        value = shares * close
+        return (date, shares, cost, invest, value, realized,
+                value + realized, total_invest)
 
     for i, bar in df.iterrows():
         date, close = bar["日期"], float(bar["收盘"])
@@ -408,6 +468,7 @@ def run_dca(df, params, pe_pct_map=None):
                 shares += new_shares
                 cost = (cost * (shares - new_shares) + close * new_shares) / shares
                 invest += amount
+                total_invest += amount
                 res.add_signal(date, close, "buy",
                                "智能定投买入" + (f"（{'；'.join(reasons)}）" if reasons else "（常规）"))
             last_mult = mult
@@ -418,41 +479,44 @@ def run_dca(df, params, pe_pct_map=None):
             pnl_ratio = (shares * close - invest) / invest
             if pnl_ratio >= target_profit * 1.5:
                 res.add_signal(date, close, "sell",
-                               f"定投全部止盈（累计收益率{pnl_ratio*100:.1f}%"
+                               f"定投全部止盈（持仓收益率{pnl_ratio*100:.1f}%"
                                f"≥{target_profit*150:.0f}%）")
-                cash_out = shares * close
+                realized += shares * close
                 shares, cost, invest = 0, 0, 0
             elif pnl_ratio >= target_profit and not sold_half:
                 res.add_signal(date, close, "sell",
-                               f"定投分批止盈（累计收益率{pnl_ratio*100:.1f}%"
+                               f"定投分批止盈（持仓收益率{pnl_ratio*100:.1f}%"
                                f"≥{target_profit*100:.0f}%，先卖一半落袋）")
+                realized += shares * close * 0.5
                 shares *= (1 - 0.5)
                 invest *= (1 - 0.5)
                 sold_half = True
             elif pct is not None and pct > pe_high and shares > 0:
                 res.add_signal(date, close, "sell",
                                f"估值止盈（PE百分位{pct*100:.0f}%>80%，部分赎回20%）")
+                realized += shares * close * 0.2
                 shares *= 0.8
                 invest *= 0.8
 
-        rows.append((date, shares, cost, invest, shares * close, 0.0))
+        rows.append(_snapshot())
 
     res.positions = pd.DataFrame(
-        rows, columns=["日期", "持仓数", "成本价", "投入资金", "市值", "可用资金"])
-    res.positions["盈亏率%"] = np.where(
-        res.positions["投入资金"] > 0,
-        (res.positions["市值"] - res.positions["投入资金"]) / res.positions["投入资金"] * 100,
+        rows, columns=["日期", "持仓数", "成本价", "投入资金", "市值", "可用资金",
+                       "权益", "累计投入"])
+    # 累计收益率 = (总权益 - 累计投入) / 累计投入，含落袋现金
+    res.positions["收益率%"] = np.where(
+        res.positions["累计投入"] > 0,
+        (res.positions["权益"] - res.positions["累计投入"])
+        / res.positions["累计投入"] * 100,
         0.0)
     res.positions["成本价"] = res.positions["成本价"].replace(0, np.nan)
+    res.total_invest = total_invest
 
     last = res.positions.iloc[-1]
-    if last["投入资金"] > 0:
-        pnl = last["盈亏率%"]
-        res.status = f"累计投入{invest:.0f}元，当前{'盈利' if pnl >= 0 else '浮亏'}{pnl:.1f}%"
-        res.status_tag = "bull" if pnl >= 0 else "hold"
-    else:
-        res.status = "空仓（已全部止盈），等待下一轮定投"
-        res.status_tag = "wait"
+    pnl = float(last["收益率%"])
+    res.status = (f"累计投入{total_invest:.0f}元，当前{'盈利' if pnl >= 0 else '亏损'}"
+                  f"{pnl:.1f}%（含落袋）")
+    res.status_tag = "bull" if pnl >= 0 else "hold"
 
     # 当期定投建议（PRD 4.4 文案示例："定投策略：本期建议加倍买入"）
     if last_mult >= 1.5:
@@ -462,6 +526,7 @@ def run_dca(df, params, pe_pct_map=None):
         res.status = "本期建议减半定投（估值过高）｜" + res.status
         res.status_tag = "bear"
     res.warnings.append("定投止盈目标与智能定投倍数均为演示参数，可在代码 core/config.py 中调整。")
+    res.finalize_signals()
     res.summarize_metrics(df["收盘"].iloc[-1])
     return res
 
