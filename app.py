@@ -252,6 +252,8 @@ def build_kline_chart(df, results, show_n=250):
 
     # ---- 买卖点标记（PRD 4.2：绿色上箭头=买，红色下箭头=卖）----
     for _, s in signals.iterrows():
+        qty = f"{s['数量']:,.0f} 股" if pd.notna(s.get("数量")) else "—"
+        pct = f"{s['仓位%']:.1f}%" if pd.notna(s.get("仓位%")) else "—"
         if s["方向"] == "buy":
             y = chart[chart["日期"] == s["日期"]]["最低"].iloc[0] * 0.985
             fig.add_trace(go.Scatter(
@@ -260,7 +262,7 @@ def build_kline_chart(df, results, show_n=250):
                 marker=dict(size=0),
                 name=f"买点·{s['策略']}", legendgroup=f"buy_{s['策略']}",
                 showlegend=False, hovertemplate=f"<b>买点</b> {s['策略']}<br>"
-                f"日期 {s['日期']}<br>原因 {s['原因']}<extra></extra>"),
+                f"日期 {s['日期']}<br>数量 {qty}｜仓位 {pct}<br>原因 {s['原因']}<extra></extra>"),
                 row=1, col=1)
         else:
             y = chart[chart["日期"] == s["日期"]]["最高"].iloc[0] * 1.015
@@ -270,7 +272,7 @@ def build_kline_chart(df, results, show_n=250):
                 marker=dict(size=0),
                 name=f"卖点·{s['策略']}", legendgroup=f"sell_{s['策略']}",
                 showlegend=False, hovertemplate=f"<b>卖点</b> {s['策略']}<br>"
-                f"日期 {s['日期']}<br>原因 {s['原因']}<extra></extra>"),
+                f"日期 {s['日期']}<br>数量 {qty}｜仓位 {pct}<br>原因 {s['原因']}<extra></extra>"),
                 row=1, col=1)
 
     # ---- 副图1：成交量（红涨绿跌）----
@@ -867,8 +869,14 @@ def render_dashboard(data, code, disp, period_label, capital, show_n,
         with st.expander("📋 全部买卖信号明细（按日期排序）"):
             sig = strategies.merge_signals(enabled)
             if len(sig):
-                st.dataframe(sig.sort_values("日期", ascending=False).head(100),
-                             width="stretch", hide_index=True)
+                sig = sig.sort_values("日期", ascending=False).head(100).copy()
+                sig["数量"] = sig["数量"].apply(
+                    lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+                sig["仓位%"] = sig["仓位%"].apply(
+                    lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+                cols = [c for c in ["日期", "策略", "方向", "价格", "数量", "仓位%", "原因"]
+                        if c in sig.columns]
+                st.dataframe(sig[cols], width="stretch", hide_index=True)
             else:
                 st.info("所选周期与策略范围内暂无信号。")
 

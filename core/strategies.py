@@ -39,9 +39,15 @@ class StrategyResult:
     total_invest: float = 0.0       # 累计投入（定投，用于累计收益率计算）
     _rows: list = field(default_factory=list, repr=False, init=False)
 
-    def add_signal(self, date, price, action, reason):
+    def add_signal(self, date, price, action, reason, qty=None, pct=None):
+        """
+        记录一条买卖信号。
+        qty：本次成交股数；pct：本次交易金额占当时总权益的百分比（仓位）。
+        仅出信号不计仓位的策略（如传统指标）不填 qty/pct，展示为"—"。
+        """
         # 先追加到列表，最后一次性建表，避免逐条 pd.concat 的 O(n^2) 开销
-        self._rows.append({"日期": date, "价格": price, "方向": action, "原因": reason})
+        self._rows.append({"日期": date, "价格": price, "方向": action, "原因": reason,
+                           "数量": qty, "仓位%": pct})
 
     def finalize_signals(self):
         """把累积的信号行转为 DataFrame 并返回。"""
@@ -221,7 +227,9 @@ def run_martingale(df, params):
             if amount <= 0 or close <= 0:
                 rows.append(_snapshot())
                 continue
-            shares = amount / close
+            new_shares = amount / close
+            pct = amount / (cash + shares * close) * 100 if cash > 0 else 0.0
+            shares = new_shares
             cost = close
             invest = amount
             cash -= amount
@@ -229,7 +237,9 @@ def run_martingale(df, params):
             ref_price = close
             adds = 0
             cycle += 1
-            res.add_signal(date, close, "buy", f"马丁初始建仓（第{cycle}轮，投入{amount:.0f}元）")
+            res.add_signal(date, close, "buy",
+                           f"马丁初始建仓（第{cycle}轮，投入{amount:.0f}元）",
+                           qty=new_shares, pct=pct)
 
         # --- 加仓：跌破 初始建仓价×(1 - n×间距) 时，金额×倍数加仓 ---
         for n in range(adds + 1, max_adds + 1):
@@ -240,6 +250,7 @@ def run_martingale(df, params):
                 if amount <= 0:
                     break
                 new_shares = amount / close
+                pct = amount / (cash + shares * close) * 100 if (cash + shares * close) > 0 else 0.0
                 shares += new_shares
                 cost = (cost * (shares - new_shares) + close * new_shares) / shares
                 invest += amount
@@ -248,7 +259,8 @@ def run_martingale(df, params):
                 adds = n
                 res.add_signal(date, close, "buy",
                                f"马丁加仓(第{n}次)：较建仓价下跌{n*drop_step*100:.0f}%，"
-                               f"投入{amount:.0f}元")
+                               f"投入{amount:.0f}元",
+                               qty=new_shares, pct=pct)
                 if n == max_adds:
                     res.warnings.append(
                         f"{date} 已达最大加仓次数 {max_adds} 次，若继续下跌资金将迅速耗尽，"
@@ -260,12 +272,14 @@ def run_martingale(df, params):
         pnl_ratio = (equity - capital) / capital
         if pnl_ratio >= target_profit:
             res.add_signal(date, close, "sell",
-                           f"马丁目标微利平仓（总盈利{pnl_ratio*100:.1f}%≥{target_profit*100:.0f}%）")
+                           f"马丁目标微利平仓（总盈利{pnl_ratio*100:.1f}%≥{target_profit*100:.0f}%）",
+                           qty=shares, pct=shares * close / equity * 100 if equity > 0 else 0.0)
             cash = equity
             shares, cost, invest, last_amount, adds, ref_price = 0, 0, 0, 0, 0, 0
         elif pnl_ratio <= stop_loss:
             res.add_signal(date, close, "sell",
-                           f"⚠️ 马丁止损清仓（总亏损{pnl_ratio*100:.1f}%，触发{stop_loss*100:.0f}%止损线）")
+                           f"⚠️ 马丁止损清仓（总亏损{pnl_ratio*100:.1f}%，触发{stop_loss*100:.0f}%止损线）",
+                           qty=shares, pct=shares * close / equity * 100 if equity > 0 else 0.0)
             cash = equity
             shares, cost, invest, last_amount, adds, ref_price = 0, 0, 0, 0, 0, 0
             stopped = True
@@ -346,7 +360,9 @@ def run_anti_martingale(df, params):
             if bool(bull_align.iloc[i]):
                 amount = cash * base_ratio
                 if amount > 0:
-                    shares = amount / close
+                    new_shares = amount / close
+                    pct = amount / (cash + shares * close) * 100 if cash > 0 else 0.0
+                    shares = new_shares
                     cost = close
                     invest = amount
                     cash -= amount
@@ -354,7 +370,8 @@ def run_anti_martingale(df, params):
                     entry_price = close
                     adds = 0
                     res.add_signal(date, close, "buy",
-                                   "反马丁顺势建仓（MA5>MA10>MA20 多头排列）")
+                                   "反马丁顺势建仓（MA5>MA10>MA20 多头排列）",
+                                   qty=new_shares, pct=pct)
         else:
             pnl_ratio = (close - cost) / cost
             ph = prior_high.iloc[i]
@@ -365,6 +382,7 @@ def run_anti_martingale(df, params):
                 amount = min(amount, cash)
                 if amount > 0:
                     new_shares = amount / close
+                    pct = amount / (cash + shares * close) * 100 if (cash + shares * close) > 0 else 0.0
                     shares += new_shares
                     cost = (cost * (shares - new_shares) + close * new_shares) / shares
                     invest += amount
@@ -373,17 +391,24 @@ def run_anti_martingale(df, params):
                     adds += 1
                     res.add_signal(date, close, "buy",
                                    f"反马丁盈利加仓(第{adds}次)：突破{lookback}日新高，"
-                                   f"持仓盈利{pnl_ratio*100:.1f}%")
+                                   f"持仓盈利{pnl_ratio*100:.1f}%",
+                                   qty=new_shares, pct=pct)
             # 离场：单笔止损 或 跌破短期均线（趋势反转）
             elif pnl_ratio <= stop_loss:
                 res.add_signal(date, close, "sell",
                                f"反马丁止损离场（浮亏{pnl_ratio*100:.1f}%，"
-                               f"触及{stop_loss*100:.0f}%止损线）")
+                               f"触及{stop_loss*100:.0f}%止损线）",
+                               qty=shares,
+                               pct=shares * close / (cash + shares * close) * 100
+                               if (cash + shares * close) > 0 else 0.0)
                 cash += shares * close
                 shares, cost, invest, last_amount, adds, entry_price = 0, 0, 0, 0, 0, 0
             elif pd.notna(df["MA5"].iloc[i]) and close < df["MA5"].iloc[i]:
                 res.add_signal(date, close, "sell",
-                               f"反马丁趋势反转离场（跌破MA5，落袋{pnl_ratio*100:.1f}%）")
+                               f"反马丁趋势反转离场（跌破MA5，落袋{pnl_ratio*100:.1f}%）",
+                               qty=shares,
+                               pct=shares * close / (cash + shares * close) * 100
+                               if (cash + shares * close) > 0 else 0.0)
                 cash += shares * close
                 shares, cost, invest, last_amount, adds, entry_price = 0, 0, 0, 0, 0, 0
 
@@ -465,35 +490,45 @@ def run_dca(df, params, pe_pct_map=None):
             amount = base_amount * mult
             if amount > 0:
                 new_shares = amount / close
+                equity_after = shares * close + realized + amount
+                pct = amount / equity_after * 100 if equity_after > 0 else 0.0
                 shares += new_shares
                 cost = (cost * (shares - new_shares) + close * new_shares) / shares
                 invest += amount
                 total_invest += amount
                 res.add_signal(date, close, "buy",
-                               "智能定投买入" + (f"（{'；'.join(reasons)}）" if reasons else "（常规）"))
+                               "智能定投买入" + (f"（{'；'.join(reasons)}）" if reasons else "（常规）"),
+                               qty=new_shares, pct=pct)
             last_mult = mult
             last_status_note = "；".join(reasons) if reasons else "常规定投"
 
         # --- 止盈：目标收益率分批/全部止盈；估值过高部分赎回 ---
         if shares > 0 and invest > 0:
             pnl_ratio = (shares * close - invest) / invest
+            equity_now = shares * close + realized
             if pnl_ratio >= target_profit * 1.5:
                 res.add_signal(date, close, "sell",
                                f"定投全部止盈（持仓收益率{pnl_ratio*100:.1f}%"
-                               f"≥{target_profit*150:.0f}%）")
+                               f"≥{target_profit*150:.0f}%）",
+                               qty=shares,
+                               pct=shares * close / equity_now * 100 if equity_now > 0 else 0.0)
                 realized += shares * close
                 shares, cost, invest = 0, 0, 0
             elif pnl_ratio >= target_profit and not sold_half:
                 res.add_signal(date, close, "sell",
                                f"定投分批止盈（持仓收益率{pnl_ratio*100:.1f}%"
-                               f"≥{target_profit*100:.0f}%，先卖一半落袋）")
+                               f"≥{target_profit*100:.0f}%，先卖一半落袋）",
+                               qty=shares * 0.5,
+                               pct=shares * close * 0.5 / equity_now * 100 if equity_now > 0 else 0.0)
                 realized += shares * close * 0.5
                 shares *= (1 - 0.5)
                 invest *= (1 - 0.5)
                 sold_half = True
             elif pct is not None and pct > pe_high and shares > 0:
                 res.add_signal(date, close, "sell",
-                               f"估值止盈（PE百分位{pct*100:.0f}%>80%，部分赎回20%）")
+                               f"估值止盈（PE百分位{pct*100:.0f}%>80%，部分赎回20%）",
+                               qty=shares * 0.2,
+                               pct=shares * close * 0.2 / equity_now * 100 if equity_now > 0 else 0.0)
                 realized += shares * close * 0.2
                 shares *= 0.8
                 invest *= 0.8
