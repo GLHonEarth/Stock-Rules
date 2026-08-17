@@ -597,6 +597,13 @@ def _stock_data_for_overview(s):
 
         tags = {"传统指标": trad.status_tag, "马丁策略": mart.status_tag,
                 "反马丁": anti.status_tag, "定投策略": dca.status_tag}
+        # 各策略持仓模拟的累计收益率%（无持仓模拟的策略为 None）
+        returns = {
+            "传统指标": None,
+            "马丁策略": mart.metrics.get("pnl_pct") if mart.metrics else None,
+            "反马丁": anti.metrics.get("pnl_pct") if anti.metrics else None,
+            "定投策略": dca.metrics.get("pnl_pct") if dca.metrics else None,
+        }
         score = sum(TAG_WEIGHT.get(t, 0) for t in tags.values())
         if any(t == "danger" for t in tags.values()):
             cat = "警示"
@@ -607,10 +614,10 @@ def _stock_data_for_overview(s):
         else:
             cat = "观望"
         return {"code": code, "name": name, "price": price,
-                "tags": tags, "score": score, "cat": cat, "err": ""}
+                "tags": tags, "returns": returns, "score": score, "cat": cat, "err": ""}
     except Exception as e:  # noqa: BLE001
         return {"code": code, "name": name, "price": None,
-                "tags": {}, "score": 0, "cat": "数据异常", "err": str(e)[:80]}
+                "tags": {}, "returns": {}, "score": 0, "cat": "数据异常", "err": str(e)[:80]}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -619,8 +626,16 @@ def _overview_data(stocks):
     return [_stock_data_for_overview(s) for s in stocks]
 
 
+def _ret_html(v):
+    """累计收益率 → 红涨绿跌小标签。"""
+    if v is None or not np.isfinite(v):
+        return "<span style='color:#475569'>—</span>"
+    color = "#22c55e" if v >= 0 else "#ef4444"
+    return f"<span style='color:{color};font-weight:700;'>{v:+.1f}%</span>"
+
+
 def _stock_card_html(r):
-    """单只股票的总览卡片（HTML）。"""
+    """单只股票的总览卡片（HTML），含各策略累计收益率。"""
     price = f"{r['price']:.2f}" if r.get("price") else "—"
     cat_color = CAT_COLOR.get(r["cat"], "#94a3b8")
     labels = [("传统", "传统指标"), ("马丁", "马丁策略"),
@@ -629,21 +644,28 @@ def _stock_card_html(r):
         f"<span style='color:{TAG_COLOR.get(r['tags'].get(k, ''), ('#94a3b8', ''))[0]}'>"
         f"{lbl}:{TAG_CN.get(r['tags'].get(k, ''), '?')}</span>"
         for lbl, k in labels)
+    ret = r.get("returns") or {}
+    rets_html = "　".join(
+        f"<span style='color:#94a3b8'>{lbl}</span>{_ret_html(ret.get(k))}"
+        for lbl, k in [("马丁", "马丁策略"), ("反马丁", "反马丁"), ("定投", "定投策略")])
     return f"""
     <div style="border:1px solid {cat_color};border-radius:8px;background:#0f172a;
-                padding:10px 14px;min-width:210px;flex:1 1 210px;">
+                padding:10px 14px;min-width:220px;flex:1 1 220px;">
       <div style="font-size:15px;font-weight:700;">{r['name']}
         <span style="color:#94a3b8;font-weight:400;">{r['code']}</span>
         <span style="float:right;color:{cat_color};font-weight:800;">{r['cat']}</span></div>
       <div style="font-size:22px;font-weight:800;margin:4px 0;color:#e2e8f0;">{price}</div>
       <div style="font-size:13px;color:#94a3b8;">{tags_html}</div>
+      <div style="font-size:13px;margin-top:6px;border-top:1px solid #1e293b;padding-top:6px;
+                  color:#94a3b8;">累计收益率　{rets_html}</div>
     </div>"""
 
 
 def render_library_overview(stocks):
     """股票库总览页：按当前策略信号综合分类展示全部股票。"""
     st.subheader("📋 股票库总览 · 按策略信号分类")
-    st.caption("综合信号 = 传统/马丁/反马丁/定投 四策略状态汇总（看多+1、看空-1、马丁警示-2）。"
+    st.caption("综合信号 = 传统/马丁/反马丁/定投 四策略状态汇总（看多+1、看空-1、马丁警示-2）；"
+               "累计收益率为各策略持仓模拟的累计收益率（含平仓落袋利润），绿涨红跌。"
                "基于本地缓存计算，点左侧「🔄 一键更新股票库数据」获取最新。")
     if not stocks:
         st.info("股票库为空，请在左侧添加股票。")
@@ -661,7 +683,7 @@ def render_library_overview(stocks):
         f"📕 看空 **{cnt.get('看空', 0)}** 只　⚠️ 警示 **{cnt.get('警示', 0)}** 只　"
         f"❌ 数据异常 **{cnt.get('数据异常', 0)}** 只")
 
-    # ---- 策略状态矩阵表 ----
+    # ---- 策略状态矩阵表（含各策略持仓模拟累计收益率）----
     df = pd.DataFrame([{
         "股票": f"{r['name']}（{r['code']}）",
         "最新价": round(r["price"], 2) if r.get("price") else None,
@@ -669,9 +691,23 @@ def render_library_overview(stocks):
         "马丁策略": TAG_CN.get(r["tags"].get("马丁策略", ""), "?"),
         "反马丁": TAG_CN.get(r["tags"].get("反马丁", ""), "?"),
         "定投策略": TAG_CN.get(r["tags"].get("定投策略", ""), "?"),
+        "马丁累计%": (r.get("returns") or {}).get("马丁策略"),
+        "反马丁累计%": (r.get("returns") or {}).get("反马丁"),
+        "定投累计%": (r.get("returns") or {}).get("定投策略"),
         "综合": r["cat"],
     } for r in rows])
-    st.dataframe(df, width="stretch", hide_index=True)
+    ret_cols = ["马丁累计%", "反马丁累计%", "定投累计%"]
+
+    def _color_ret(v):
+        if pd.isna(v):
+            return ""
+        return ("background-color: rgba(34,197,94,0.22);" if v >= 0
+                else "background-color: rgba(239,68,68,0.22);")
+
+    styled = (df.style
+              .format({c: "{:+.1f}%" for c in ret_cols}, na_rep="—")
+              .map(_color_ret, subset=ret_cols))
+    st.dataframe(styled, width="stretch", hide_index=True)
 
     # ---- 按分类分组展示卡片 ----
     for cat in ("看多", "观望", "看空", "警示", "数据异常"):
