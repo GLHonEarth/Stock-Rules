@@ -185,24 +185,37 @@ def _iter_signals(mask, df, reason):
 # 2. 马丁策略（PRD 3.2）—— 越跌越买，亏损加仓
 # --------------------------------------------------------------------------
 def run_martingale(df, params):
+    """
+    马丁策略（优化版）：
+      - 修复退化空转：目标微利按「本周期持仓投入」计算（原按含闲置现金的总权益，
+        第一轮盈利后每轮建仓立即原价平仓，收益率永远卡死在首轮）
+      - 仓位上限 max_position：加仓总额不超过 资金×比例，防止加仓无限放大亏损
+      - 止损后 reentry：等价格收复 MA60 重新入场，避免永久停止
+    """
     capital = float(params["capital"])
     drop_step = float(params["drop_step"])
     multiply = float(params["multiply"])
     max_adds = int(params["max_adds"])
-    target_profit = float(params["target_profit"])
-    stop_loss = float(params["stop_loss"])
+    target_profit = float(params["target_profit"])   # 持仓目标收益
+    stop_loss = float(params["stop_loss"])           # 总资金止损
     init_ratio = float(params["init_ratio"])
+    max_position = float(params.get("max_position", 0.55))
+    reentry = bool(params.get("reentry", True))
 
     res = StrategyResult(name="马丁策略")
     res.capital = capital
     res.warnings.append(
         "⚠️ 马丁策略在单边下跌行情中资金消耗呈指数级增长，极易爆仓。"
-        f"本系统已强制设置：最大加仓次数 {max_adds} 次、总资金止损线 {stop_loss*100:.0f}%。")
+        f"本系统已强制设置：最大加仓次数 {max_adds} 次、仓位上限 {max_position*100:.0f}%、"
+        f"总资金止损线 {stop_loss*100:.0f}%。")
+
+    df2 = ind.add_all(df)
+    ma60 = df2["MA60"].to_numpy() if "MA60" in df2.columns else None
 
     cash = capital
     shares = 0.0
     cost = 0.0            # 加权平均成本
-    invest = 0.0          # 持仓累计投入
+    invest = 0.0          # 本周期持仓累计投入
     last_amount = 0.0     # 最近一次买入金额（用于计算下次加仓金额）
     adds = 0              # 本周期已加仓次数
     ref_price = 0.0       # 本周期初始建仓价
@@ -219,11 +232,16 @@ def run_martingale(df, params):
 
         if stopped:
             rows.append(_snapshot())
-            continue
+            # 止损后重新入场：价格收复 MA60
+            if (reentry and ma60 is not None and pd.notna(ma60[i])
+                    and close > ma60[i]):
+                stopped = False
+            else:
+                continue
 
         # --- 建仓：空仓时在当期收盘价买入初始仓位 ---
         if shares <= 0:
-            amount = cash * init_ratio
+            amount = min(cash * init_ratio, capital * max_position)
             if amount <= 0 or close <= 0:
                 rows.append(_snapshot())
                 continue
@@ -244,9 +262,9 @@ def run_martingale(df, params):
         # --- 加仓：跌破 初始建仓价×(1 - n×间距) 时，金额×倍数加仓 ---
         for n in range(adds + 1, max_adds + 1):
             if close <= ref_price * (1 - drop_step * n):
-                amount = last_amount * multiply
-                # 现金不足时按剩余现金加仓
-                amount = min(amount, cash)
+                # 现金不足 或 仓位已达上限 时不再加仓
+                amount = min(last_amount * multiply, cash,
+                             capital * max_position - invest)
                 if amount <= 0:
                     break
                 new_shares = amount / close
@@ -267,23 +285,27 @@ def run_martingale(df, params):
                         "请严格执行止损纪律。")
                 break
 
-        # --- 平仓判定：目标微利 / 总资金止损 ---
-        equity = cash + shares * close
-        pnl_ratio = (equity - capital) / capital
-        if pnl_ratio >= target_profit:
+        # --- 平仓：持仓目标收益（修复退化空转）/ 总资金止损 ---
+        pos_value = shares * close
+        equity = cash + pos_value
+        if pos_value >= invest * (1 + target_profit):
             res.add_signal(date, close, "sell",
-                           f"马丁目标微利平仓（总盈利{pnl_ratio*100:.1f}%≥{target_profit*100:.0f}%）",
-                           qty=shares, pct=shares * close / equity * 100 if equity > 0 else 0.0)
+                           f"马丁目标微利平仓（持仓盈利{(pos_value/invest-1)*100:.1f}%"
+                           f"≥{target_profit*100:.0f}%）",
+                           qty=shares,
+                           pct=pos_value / equity * 100 if equity > 0 else 0.0)
             cash = equity
             shares, cost, invest, last_amount, adds, ref_price = 0, 0, 0, 0, 0, 0
-        elif pnl_ratio <= stop_loss:
+        elif equity <= capital * (1 + stop_loss):
             res.add_signal(date, close, "sell",
-                           f"⚠️ 马丁止损清仓（总亏损{pnl_ratio*100:.1f}%，触发{stop_loss*100:.0f}%止损线）",
-                           qty=shares, pct=shares * close / equity * 100 if equity > 0 else 0.0)
+                           f"⚠️ 马丁止损清仓（总资金回撤至{(equity/capital-1)*100:.1f}%，"
+                           f"触发{stop_loss*100:.0f}%止损线）",
+                           qty=shares,
+                           pct=pos_value / equity * 100 if equity > 0 else 0.0)
             cash = equity
             shares, cost, invest, last_amount, adds, ref_price = 0, 0, 0, 0, 0, 0
             stopped = True
-            res.status = f"已触发止损（-{stop_loss*100:.0f}%），交易已停止，建议观望"
+            res.status = f"已触发止损（-{stop_loss*100:.0f}%），等待价格收复60日均线后重新入场"
             res.status_tag = "danger"
 
         rows.append(_snapshot())
