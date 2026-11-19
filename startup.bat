@@ -1,36 +1,42 @@
 @echo off
-chcp 65001 >nul
-title è‚¡ç¥¨æ™ºèƒ½æŠ€æœ¯åˆ†æä¸ç­–ç•¥å†³ç­–ç³»ç»Ÿ
+chcp 936 >nul
+title ¹ÉÆ±ÖÇÄÜ¼¼Êõ·ÖÎöÓë²ßÂÔ¾ö²ßÏµÍ³
 cd /d %~dp0
 
 echo ============================================
-echo  è‚¡ç¥¨æ™ºèƒ½æŠ€æœ¯åˆ†æä¸ç­–ç•¥å†³ç­–ç³»ç»Ÿ - å¯åŠ¨ä¸­...
+echo  ¹ÉÆ±ÖÇÄÜ¼¼Êõ·ÖÎöÓë²ßÂÔ¾ö²ßÏµÍ³ - Æô¶¯ÖĞ...
 echo ============================================
 echo.
 
-rem æ£€æŸ¥ Python
+rem ¼ì²é Python
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [é”™è¯¯] æœªæ£€æµ‹åˆ° Pythonï¼Œè¯·å…ˆå®‰è£… Python 3.9+ï¼ˆæ¨è Anacondaï¼‰
+    echo [´íÎó] Î´¼ì²âµ½ Python£¬ÇëÏÈ°²×° Python 3.9+£¨ÍÆ¼ö Anaconda£©
     pause
     exit /b 1
 )
 
-rem æ£€æŸ¥ä¾èµ–ï¼Œç¼ºå¤±åˆ™è‡ªåŠ¨å®‰è£…ï¼ˆå›½å†…ç½‘ç»œè‡ªåŠ¨ä½¿ç”¨æ¸…åé•œåƒåŠ é€Ÿï¼‰
+rem ¼ì²éÒÀÀµ£¬È±Ê§Ôò×Ô¶¯°²×°£¨¹úÄÚÍøÂç×Ô¶¯Ê¹ÓÃÇå»ª¾µÏñ¼ÓËÙ£©
+rem Í³Ò»ÓÃ python -m µ÷ÓÃ£¬±ÜÃâ pip/streamlit µÄ Scripts Ä¿Â¼²»ÔÚ PATH Ê±ÕÒ²»µ½ÃüÁî
 python -c "import streamlit, akshare, pandas, numpy, plotly, requests" >nul 2>nul
 if errorlevel 1 (
-    echo [æç¤º] é¦–æ¬¡è¿è¡Œï¼Œæ­£åœ¨å®‰è£…ä¾èµ–ï¼ˆçº¦éœ€ 2-5 åˆ†é’Ÿï¼Œè¯·è€å¿ƒç­‰å¾…ï¼‰...
-    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo [ÌáÊ¾] Ê×´ÎÔËĞĞ£¬ÕıÔÚ°²×°ÒÀÀµ£¨Ô¼Ğè 2-5 ·ÖÖÓ£¬ÇëÄÍĞÄµÈ´ı£©...
+    python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     if errorlevel 1 (
-        echo [æç¤º] é•œåƒå®‰è£…å¤±è´¥ï¼Œæ”¹ç”¨é»˜è®¤æºé‡è¯•...
-        pip install -r requirements.txt
+        echo [ÌáÊ¾] ¾µÏñ°²×°Ê§°Ü£¬¸ÄÓÃÄ¬ÈÏÔ´ÖØÊÔ...
+        python -m pip install -r requirements.txt
     )
 )
 
 echo.
-echo [æç¤º] å¯åŠ¨æˆåŠŸåæµè§ˆå™¨å°†è‡ªåŠ¨æ‰“å¼€ http://localhost:8501
-echo        è‹¥æœªè‡ªåŠ¨æ‰“å¼€ï¼Œè¯·æ‰‹åŠ¨åœ¨æµè§ˆå™¨è®¿é—®è¯¥åœ°å€ã€‚
-echo        å…³é—­æœ¬çª—å£å³å¯åœæ­¢ç³»ç»Ÿã€‚
+echo [ÌáÊ¾] Æô¶¯³É¹¦ºóä¯ÀÀÆ÷½«×Ô¶¯´ò¿ª http://localhost:8501
+echo        ÈôÎ´×Ô¶¯´ò¿ª£¬ÇëÊÖ¶¯ÔÚä¯ÀÀÆ÷·ÃÎÊ¸ÃµØÖ·¡£
+echo        ¹Ø±Õ±¾´°¿Ú¼´¿ÉÍ£Ö¹ÏµÍ³¡£
 echo.
-streamlit run app.py
+
+rem ÓÃ python -m streamlit Æô¶¯£º
+rem   1) ²»ÒÀÀµ streamlit.exe ÊÇ·ñÔÚ PATH£¨Ö±½ÓÇÃ streamlit ¿ÉÄÜÌáÊ¾"²»ÊÇÄÚ²¿»òÍâ²¿ÃüÁî"£©
+rem   2) .streamlit\config.toml ÒÑ¹Ø±ÕÊ×´ÎÔËĞĞµÄÓÊÏäÌáÊ¾£¬±ÜÃâ¿¨ÔÚ Email: µ¼ÖÂ·şÎñÆğ²»À´
+rem ×¢Òâ£º±¾ÎÄ¼ş±ØĞë±£´æÎª UTF-8 + CRLF »»ĞĞ£¬LF »»ĞĞ»áµ¼ÖÂ cmd °ÑÖĞÎÄĞĞ½âÎö´íÂÒ
+python -m streamlit run app.py --server.headless false --server.showEmailPrompt false --server.port 8501 --browser.serverAddress localhost
 pause

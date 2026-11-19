@@ -1,0 +1,2 @@
+# Windows 批处理必须保持 CRLF，LF 换行会让 cmd 解析中文行错位、启动脚本失效
+*.bat text eol=crlf

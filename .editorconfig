@@ -1,0 +1,14 @@
+root = true
+
+# 本工程所有文件默认 UTF-8 + LF
+[*.{py,md,json,toml,txt,html,css,js,ts,yml,yaml,ini,cfg}]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Windows 批处理例外：cmd 要求 CRLF
+# （该文件为 GBK 编码：cmd 解析 UTF-8 中文批处理会错位）
+[*.bat]
+end_of_line = crlf
+insert_final_newline = true

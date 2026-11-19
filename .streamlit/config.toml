@@ -1,0 +1,16 @@
+# Streamlit 项目级配置（放在项目根目录，启动时自动生效）
+# 作用：跳过首次运行的邮箱提示、固定端口、启动后自动打开浏览器
+
+[server]
+# 首次运行 Streamlit 会阻塞在 "Email:" 提示上，导致服务根本没起来，
+# 浏览器访问 localhost:8501 就会提示“拒绝访问”。关闭该提示。
+showEmailPrompt = false
+# 不进入 headless 模式：启动成功后自动打开浏览器
+headless = false
+port = 8501
+
+[browser]
+# 自动打开的地址固定为 http://localhost:8501
+serverAddress = "localhost"
+# 关闭匿名使用统计上报
+gatherUsageStats = false

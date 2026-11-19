@@ -1,0 +1,12 @@
+{
+  // 本工程所有文件默认以 UTF-8 打开 / 保存
+  "files.encoding": "utf8",
+  "files.autoGuessEncoding": false,
+
+  // 唯一例外：startup.bat 必须保持 GBK + CRLF
+  // （cmd 解析 UTF-8 中文批处理文件会错位，导致脚本行被拆坏、启动失败）
+  "[bat]": {
+    "files.encoding": "gbk",
+    "files.eol": "\r\n"
+  }
+}

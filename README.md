@@ -35,7 +35,7 @@ Streamlit 可视化看板中展示，辅助投资决策。
 ### 第 1 步：进入项目目录
 
 ```bash
-cd d:\Code\StockRules
+cd /d d:\Codes\Stock-Rules
 ```
 
 ### 第 2 步：安装依赖
@@ -50,11 +50,16 @@ pip install -r requirements.txt
 ### 第 3 步：启动系统
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
+
+> 请使用 `python -m streamlit`，不要直接敲 `streamlit`：若 Python 的 Scripts 目录不在 PATH 中，
+> 会提示 `'streamlit' 不是内部或外部命令`，服务根本没启动，浏览器访问就会显示“拒绝访问”。
 
 启动成功后，终端会显示本地访问地址，浏览器会自动打开
 **http://localhost:8501**（若未自动打开，手动复制该地址到浏览器）。
+项目自带的 `.streamlit/config.toml` 已关闭 Streamlit 首次运行的邮箱输入提示
+（否则会卡在 `Email:` 一行，服务一直起不来）。
 
 ---
 
@@ -123,7 +128,9 @@ streamlit run app.py
 | 分时模式下没有策略信号 | 正常。分时仅展示当日走势，策略信号基于日/周/月 K 线计算 |
 | 不同周期/不同显示数量下策略结果不同 | 策略在所选 K 线周期的**完整历史**上回测（指标边界值连续），图表仅影响展示多少根 K 线 |
 | 想调整策略参数（加仓倍数、止盈目标等） | 编辑 [core/config.py](core/config.py) 中的 `STRATEGY_PARAMS`，保存后刷新页面即可 |
-| 端口 8501 被占用 | 终端执行 `streamlit run app.py --server.port 8502` |
+| 浏览器没有自动打开，手动访问 localhost:8501 提示“拒绝访问/无法连接” | 说明 Streamlit 服务没有起来（“拒绝访问”= 端口上没有服务在监听），不是浏览器问题。常见原因有两个：① 直接敲了 `streamlit run app.py`，但 `streamlit` 命令不在 PATH 中；② 首次运行卡在 `Email:` 邮箱提示。本项目已通过 `.streamlit/config.toml` 关闭该提示，请改用 `python -m streamlit run app.py` 或双击 `startup.bat` 启动，终端出现 `Local URL: http://localhost:8501` 后再访问 |
+| 端口 8501 被占用 | 终端执行 `python -m streamlit run app.py --server.port 8502` |
+| 打开文件中文乱码 | 本工程默认 **UTF-8**（见 `.editorconfig` 与 `.vscode/settings.json`），VSCode 打开即正常。唯一例外是 `startup.bat`：它必须用 **GBK + CRLF** 打开/保存，否则 cmd 解析中文批处理会错位导致启动失败（VSCode 已按 `[bat]` 语言单独配置，无需手动处理） |
 
 ## 六、项目结构
 
@@ -141,6 +148,11 @@ StockRules/
 ├── test_offline.py         # 离线 UI 验证（缓存优先/切换/删除，python test_offline.py）
 ├── requirements.txt        # 依赖清单
 ├── startup.bat            # Windows 一键启动
+├── .streamlit/
+│   └── config.toml        # Streamlit 配置：跳过首次邮箱提示、固定 8501 端口、自动开浏览器
+├── .editorconfig          # 工程默认编码 UTF-8（startup.bat 为例外）
+├── .vscode/settings.json  # VSCode 工作区默认 UTF-8，startup.bat 单独用 GBK
+├── .gitattributes         # 保证 *.bat 检出时始终为 CRLF
 ├── data/                   # 股票库配置（stock_library.json）
 ├── cache/                  # 数据缓存目录（自动生成）
 └── request.md              # 原始需求文档（PRD）
